@@ -1,0 +1,492 @@
+#ifndef CTPY__EXEC__HPP
+#define CTPY__EXEC__HPP
+
+#include "version.hpp"
+#include "text.hpp"
+#include "ast.hpp"
+#include "object.hpp"
+#include "parse.hpp"
+#include "eval.hpp"
+#include "builtins.hpp"
+
+#ifndef CTPY_IN_A_MODULE
+#include <cstddef>
+#include <cstdint>
+#include <string_view>
+#include <type_traits>
+#endif
+
+// Statement execution: exec<Stmt>(state) -> Flow, the value-level
+// tree-walk over compound statements. Control transfers are FLOW
+// SIGNALS threaded through return values - a break/continue unwinds
+// suites until the innermost loop absorbs it, a return (M5) until the
+// call absorbs it. Python exceptions stay on the soft channel
+// (state.raised + PyError, NEVER C++ exceptions): a raised state makes
+// every subsequent statement a no-op and the leftover Flow::next
+// carries the walk out.
+//
+// Python semantics implemented here, deliberately:
+//   - chained assignment `a = b = v` evaluates v ONCE, then assigns
+//     the targets left to right; tuple targets unpack any iterable
+//     (tuple/list/str/range) with CPython's ValueError messages;
+//   - `while`/`for` else-suites run only when the loop was NOT left
+//     by break;
+//   - for-loops iterate range objects lazily (no materialization) and
+//     str per character;
+//   - break/continue/return that escape to module level are the
+//     SyntaxErrors CPython reports (soft, since the grammar accepts
+//     them anywhere).
+//
+// ctpy::run<Src>() executes a whole module and snapshots the globals
+// into an INTERIM result: ok()/exception() plus ["name"].to<T>() for
+// scalars and str. The full right-sized value views land in M8.
+
+namespace ctpy {
+
+// how a statement finished: fell through, or is transferring control
+CTPY_EXPORT enum class Flow : unsigned char {
+	next,      // fall through to the next statement
+	break_,    // unwinding to the innermost loop
+	continue_, // unwinding to the innermost loop's next iteration
+	return_,   // unwinding to the innermost call (lands in M5)
+};
+
+namespace detail {
+
+template <typename Stmt> struct executor {
+	static_assert(sizeof(Stmt) == 0,
+		"ctpy: this statement kind is not executable yet (later milestone)");
+};
+
+template <typename Stmt, typename St> constexpr Flow exec_node(St & st) {
+	if (st.raised) {
+		return Flow::next; // exception in flight: every statement is a no-op
+	}
+	return executor<Stmt>::run(st);
+}
+
+// --- iteration over the sequence kinds (str/range/tuple/list) --------------
+
+constexpr bool iterable_kind(Kind kind) noexcept {
+	return kind == Kind::str || kind == Kind::range || kind == Kind::tuple || kind == Kind::list;
+}
+
+template <typename St> constexpr long long iter_len(const St & st, const Object & sequence) noexcept {
+	if (sequence.kind == Kind::range) {
+		return range_len(st.a.objs[sequence.first].i,
+		                 st.a.objs[sequence.first + 1].i,
+		                 st.a.objs[sequence.first + 2].i);
+	}
+	return static_cast<long long>(sequence.count);
+}
+
+// the object (index) of element `at`; str and range mint a fresh
+// object, tuple/list elements are already pool slots. `sequence` must
+// be a caller-held COPY - the pool grows underneath a live loop.
+template <typename St> constexpr std::uint32_t iter_get(St & st, const Object & sequence, long long at) {
+	switch (sequence.kind) {
+		case Kind::str:
+			return st.make_str(st.str_of(sequence).substr(static_cast<std::size_t>(at), 1));
+		case Kind::range: {
+			const long long start = st.a.objs[sequence.first].i;
+			const long long step = st.a.objs[sequence.first + 2].i;
+			return st.make_int(start + at * step);
+		}
+		default: // tuple/list: a contiguous run of pool slots
+			return sequence.first + static_cast<std::uint32_t>(at);
+	}
+}
+
+// --- assignment targets ------------------------------------------------------
+
+// no specialization = the target kind is not assignable yet
+// (subscript/attribute targets land in M6)
+template <typename Target> struct assign_target {
+	static_assert(sizeof(Target) == 0,
+		"ctpy: assignment to this target kind is not executable yet (later milestone)");
+};
+
+template <typename Text> struct assign_target<ast::name<Text>> {
+	template <typename St> static constexpr void run(St & st, std::uint32_t value) {
+		st.bind(Text::view(), value);
+	}
+};
+
+template <typename... Es> struct unpack_into;
+template <> struct unpack_into<> {
+	template <typename St> static constexpr void run(St &, const Object &, long long) noexcept { }
+};
+template <typename E, typename... Rest> struct unpack_into<E, Rest...> {
+	template <typename St> static constexpr void run(St & st, const Object & source, long long at) {
+		const std::uint32_t element = iter_get(st, source, at);
+		assign_target<E>::run(st, element);
+		if (st.raised) {
+			return;
+		}
+		unpack_into<Rest...>::run(st, source, at + 1);
+	}
+};
+
+// a, b = ... unpacks any iterable, arity-checked the CPython way
+template <typename... Es> struct assign_target<ast::tuple_expr<Es...>> {
+	template <typename St> static constexpr void run(St & st, std::uint32_t value) {
+		const Object source = st.a.objs[value]; // copy: unpacking allocates
+		if (!iterable_kind(source.kind)) {
+			st.raise_error(ex_kind::TypeError,
+				{"cannot unpack non-iterable ", type_name(source.kind), " object"});
+			return;
+		}
+		constexpr long long want = static_cast<long long>(sizeof...(Es));
+		const long long have = iter_len(st, source);
+		if (have < want) {
+			const auto wanted = dec(want);
+			const auto got = dec(have);
+			st.raise_error(ex_kind::ValueError,
+				{"not enough values to unpack (expected ", wanted.view(), ", got ", got.view(), ")"});
+			return;
+		}
+		if (have > want) {
+			const auto wanted = dec(want);
+			st.raise_error(ex_kind::ValueError,
+				{"too many values to unpack (expected ", wanted.view(), ")"});
+			return;
+		}
+		unpack_into<Es...>::run(st, source, 0);
+	}
+};
+
+// --- simple statements ----------------------------------------------------------
+
+template <typename E> struct executor<ast::expr_stmt<E>> {
+	template <typename St> static constexpr Flow run(St & st) {
+		(void)eval_node<E, St>(st);
+		return Flow::next;
+	}
+};
+
+template <> struct executor<ast::pass_stmt> {
+	template <typename St> static constexpr Flow run(St &) noexcept {
+		return Flow::next;
+	}
+};
+template <> struct executor<ast::break_stmt> {
+	template <typename St> static constexpr Flow run(St &) noexcept {
+		return Flow::break_;
+	}
+};
+template <> struct executor<ast::continue_stmt> {
+	template <typename St> static constexpr Flow run(St &) noexcept {
+		return Flow::continue_;
+	}
+};
+
+template <typename V, typename... Targets> struct executor<ast::assign_stmt<V, Targets...>> {
+	template <typename St> static constexpr Flow run(St & st) {
+		const std::uint32_t value = eval_node<V, St>(st);
+		if (st.raised) {
+			return Flow::next;
+		}
+		// chained targets assign left to right, all from the one value
+		(void)((assign_target<Targets>::run(st, value), !st.raised) && ...);
+		return Flow::next;
+	}
+};
+
+// aug-assign; only name targets exist before M6's subscript/attribute stores
+template <typename Op, typename Target, typename V> struct aug_exec {
+	static_assert(sizeof(Target) == 0,
+		"ctpy: aug-assign to this target kind is not executable yet (later milestone)");
+};
+template <typename Op, typename Text, typename V> struct aug_exec<Op, ast::name<Text>, V> {
+	template <typename St> static constexpr Flow run(St & st) {
+		const std::uint32_t current = st.lookup(Text::view());
+		if (current == not_found) {
+			st.raise_error(ex_kind::NameError, {"name '", Text::view(), "' is not defined"});
+			return Flow::next;
+		}
+		const std::uint32_t value = eval_node<V, St>(st);
+		if (st.raised) {
+			return Flow::next;
+		}
+		const std::uint32_t result = bin_op(st, bop_of<Op>::value, current, value);
+		if (!st.raised) {
+			st.bind(Text::view(), result);
+		}
+		return Flow::next;
+	}
+};
+template <typename Op, typename Target, typename V> struct executor<ast::aug_stmt<Op, Target, V>> {
+	template <typename St> static constexpr Flow run(St & st) {
+		return aug_exec<Op, Target, V>::run(st);
+	}
+};
+
+// --- suites and compound statements -----------------------------------------------
+
+template <typename... Stmts> struct executor<ast::suite<Stmts...>> {
+	template <typename St> static constexpr Flow run(St & st) {
+		Flow flow = Flow::next;
+		(void)(((flow = exec_node<Stmts, St>(st)), flow == Flow::next && !st.raised) && ...);
+		return flow;
+	}
+};
+
+// an absent else-suite (the `void` slot) falls through
+template <typename Else, typename St> constexpr Flow exec_else(St & st) {
+	if constexpr (std::is_void_v<Else>) {
+		return Flow::next;
+	} else {
+		return exec_node<Else, St>(st);
+	}
+}
+
+template <typename Clauses, typename Else> struct elif_chain;
+template <typename Else> struct elif_chain<ast::clause_pack<>, Else> {
+	template <typename St> static constexpr Flow run(St & st) {
+		return exec_else<Else>(st);
+	}
+};
+template <typename Test, typename Body, typename... Rest, typename Else>
+struct elif_chain<ast::clause_pack<ast::elif_clause<Test, Body>, Rest...>, Else> {
+	template <typename St> static constexpr Flow run(St & st) {
+		const std::uint32_t condition = eval_node<Test, St>(st);
+		if (st.raised) {
+			return Flow::next;
+		}
+		if (st.truthy(condition)) {
+			return exec_node<Body, St>(st);
+		}
+		return elif_chain<ast::clause_pack<Rest...>, Else>::run(st);
+	}
+};
+
+template <typename Test, typename Body, typename Elifs, typename Else>
+struct executor<ast::if_stmt<Test, Body, Elifs, Else>> {
+	template <typename St> static constexpr Flow run(St & st) {
+		const std::uint32_t condition = eval_node<Test, St>(st);
+		if (st.raised) {
+			return Flow::next;
+		}
+		if (st.truthy(condition)) {
+			return exec_node<Body, St>(st);
+		}
+		return elif_chain<Elifs, Else>::run(st);
+	}
+};
+
+template <typename Test, typename Body, typename Else>
+struct executor<ast::while_stmt<Test, Body, Else>> {
+	template <typename St> static constexpr Flow run(St & st) {
+		while (true) {
+			const std::uint32_t condition = eval_node<Test, St>(st);
+			if (st.raised) {
+				return Flow::next;
+			}
+			if (!st.truthy(condition)) {
+				break; // normal exhaustion: the else-suite runs
+			}
+			const Flow flow = exec_node<Body, St>(st);
+			if (st.raised) {
+				return Flow::next;
+			}
+			if (flow == Flow::break_) {
+				return Flow::next; // break skips the else-suite
+			}
+			if (flow == Flow::return_) {
+				return flow;
+			}
+			// Flow::next and Flow::continue_ both just iterate
+		}
+		return exec_else<Else>(st);
+	}
+};
+
+template <typename Target, typename Iter, typename Body, typename Else>
+struct executor<ast::for_stmt<Target, Iter, Body, Else>> {
+	template <typename St> static constexpr Flow run(St & st) {
+		const std::uint32_t iterable = eval_node<Iter, St>(st);
+		if (st.raised) {
+			return Flow::next;
+		}
+		const Object sequence = st.a.objs[iterable]; // copy: the pool grows under the loop
+		if (!iterable_kind(sequence.kind)) {
+			st.raise_error(ex_kind::TypeError,
+				{"'", type_name(sequence.kind), "' object is not iterable"});
+			return Flow::next;
+		}
+		const long long limit = iter_len(st, sequence);
+		for (long long at = 0; at < limit; ++at) {
+			const std::uint32_t element = iter_get(st, sequence, at);
+			assign_target<Target>::run(st, element);
+			if (st.raised) {
+				return Flow::next;
+			}
+			const Flow flow = exec_node<Body, St>(st);
+			if (st.raised) {
+				return Flow::next;
+			}
+			if (flow == Flow::break_) {
+				return Flow::next; // break skips the else-suite
+			}
+			if (flow == Flow::return_) {
+				return flow;
+			}
+		}
+		return exec_else<Else>(st);
+	}
+};
+
+// the module body; a control transfer that escapes to module level is
+// the SyntaxError CPython reports (soft - the grammar accepts the
+// statement anywhere, the semantic check lives here)
+template <typename... Stmts> struct executor<ast::module<Stmts...>> {
+	template <typename St> static constexpr Flow run(St & st) {
+		Flow flow = Flow::next;
+		(void)(((flow = exec_node<Stmts, St>(st)), flow == Flow::next && !st.raised) && ...);
+		if (!st.raised) {
+			switch (flow) {
+				case Flow::next: break;
+				case Flow::break_:
+					st.raise_error(ex_kind::SyntaxError, "'break' outside loop");
+					break;
+				case Flow::continue_:
+					st.raise_error(ex_kind::SyntaxError, "'continue' not properly in loop");
+					break;
+				case Flow::return_:
+					st.raise_error(ex_kind::SyntaxError, "'return' outside function");
+					break;
+			}
+		}
+		return Flow::next;
+	}
+};
+
+} // namespace detail
+
+// execute one statement (or suite, or whole module) inside a live
+// interpreter state, returning how control left it
+CTPY_EXPORT template <typename Stmt, typename St> constexpr Flow exec(St & st) {
+	return detail::exec_node<Stmt, St>(st);
+}
+
+// --- ctpy::run<Src>: execute a module, snapshot the globals -------------------
+
+// one global's value as copied out of the (dead) arena. INTERIM shape:
+// scalars and str only - M8's right-sized ctpy::value views replace
+// this wholesale (container payloads read as their Kind with an empty
+// payload until then).
+CTPY_EXPORT struct run_value {
+	static constexpr std::size_t str_capacity = 64;
+
+	Kind kind = Kind::none;
+	bool bound = false; // false = the name was never assigned
+	long long int_value = 0;
+	double float_value = 0.0;
+	ctc::string<str_capacity> str_value{};
+
+	constexpr bool exists() const noexcept {
+		return bound;
+	}
+	constexpr std::string_view str() const noexcept {
+		return str_value.view();
+	}
+	template <typename T> constexpr T to() const noexcept {
+		if constexpr (std::is_same_v<T, bool>) {
+			switch (kind) {
+				case Kind::boolean:
+				case Kind::int_: return int_value != 0;
+				case Kind::float_: return float_value != 0.0;
+				case Kind::str: return !str_value.empty();
+				default: return false;
+			}
+		} else if constexpr (std::is_floating_point_v<T>) {
+			return kind == Kind::float_ ? static_cast<T>(float_value) : static_cast<T>(int_value);
+		} else {
+			static_assert(std::is_integral_v<T>, "run_value::to<T>: T must be arithmetic in M4");
+			return kind == Kind::float_ ? static_cast<T>(float_value) : static_cast<T>(int_value);
+		}
+	}
+};
+
+// one snapshotted global (the name view points into ast text<> static
+// storage, which outlives every result)
+CTPY_EXPORT struct global_entry {
+	std::string_view name{};
+	run_value value{};
+};
+
+// the result of running a module: ok()/exception() plus the globals
+// by name. INTERIM - M8 right-sizes into per-Src static storage with
+// uniform chaining views and stdout capture.
+CTPY_EXPORT struct run_result {
+	static constexpr std::size_t globals_capacity = 64;
+
+	ctc::vector<global_entry, globals_capacity> globals{};
+	bool raised = false;
+	PyError error{};
+
+	constexpr bool ok() const noexcept {
+		return !raised;
+	}
+	constexpr const PyError & exception() const noexcept {
+		return error;
+	}
+	constexpr run_value operator[](std::string_view name) const noexcept {
+		for (std::size_t at = 0; at < globals.size(); ++at) {
+			if (globals[at].name == name) {
+				return globals[at].value;
+			}
+		}
+		return run_value{}; // unbound: kind none, exists() false
+	}
+};
+
+// run a Python module at compile time.
+//   constexpr auto out = ctpy::run<"total = 0\nfor i in range(5):\n    total += i\n">();
+//   static_assert(out.ok() && out["total"].to<int>() == 10);
+// Family policy: a NON-PARSING source hard-errors here (static_assert
+// names the stage); a RAISING script is a soft ok()==false result.
+CTPY_EXPORT template <ctll::fixed_string Src, typename ArenaT = Arena<>>
+constexpr run_result run() noexcept {
+	static_assert(is_valid<Src>, "ctpy::run<Src>: the source failed to pre-lex or parse");
+	using Module = detail::parsed_module<Src>;
+	State<ArenaT> st{};
+	(void)detail::exec_node<Module, State<ArenaT>>(st);
+	run_result out{};
+	out.raised = st.raised;
+	out.error = st.error;
+	for (std::uint32_t at = 0; at < st.globals_count; ++at) {
+		if (out.globals.size() == run_result::globals_capacity) {
+			break; // interim cap; M8 right-sizes per Src
+		}
+		const Binding & binding = st.a.frames[at];
+		const Object & object = st.a.objs[binding.obj];
+		run_value value{};
+		value.bound = true;
+		value.kind = object.kind;
+		switch (object.kind) {
+			case Kind::boolean:
+			case Kind::int_:
+				value.int_value = object.i;
+				break;
+			case Kind::float_:
+				value.float_value = object.f;
+				break;
+			case Kind::str: {
+				const std::string_view content = st.str_of(object);
+				value.str_value.append(content.size() <= run_value::str_capacity
+					? content
+					: content.substr(0, run_value::str_capacity));
+				break;
+			}
+			default:
+				break; // container payloads land with the M8 value views
+		}
+		out.globals.push_back(global_entry{binding.name, value});
+	}
+	return out;
+}
+
+} // namespace ctpy
+
+#endif

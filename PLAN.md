@@ -250,6 +250,28 @@ manual `cp -R` + `diff -rq` in CLAUDE.md.
   list since the AST already carries them; container branches of
   object_eq/contains are pre-wired for M6.
 
+- **M4 statements/control: DONE.** exec.hpp (`exec<Stmt>(State&) ->
+  Flow` value-level tree-walk: expr/assign/aug-assign/pass,
+  if/elif/else, while and for with break/continue/else, Flow signals
+  threaded through suites; chained assignment evaluates the value once
+  then binds targets left-to-right; tuple targets unpack any
+  tuple/list/str/range iterable with CPython's ValueError arity
+  messages; module-level break/continue/return become soft
+  SyntaxErrors) and builtins.hpp (name-call dispatch: bound names
+  shadow builtins, else the builtin table - just `range` for now, a
+  LAZY range object: Kind::range whose start/stop/step live as three
+  pool ints, iterated arithmetically, `in`/`==` computed without
+  materialization). Interim `ctpy::run<Src>()` -> run_result: executes
+  the module body and snapshots globals (`ok()`, `exception()`,
+  `["name"]` -> run_value with to<T>()/str()/exists()/kind); container
+  globals report their Kind with an empty payload until the M8 views.
+  tuple/list DISPLAY evaluation landed early in eval.hpp (unpacking and
+  for-iteration need them): elements evaluate in order, then the
+  element objects are copied into one contiguous pool run. Semantic
+  checks live where CPython puts them: `range = 3; range(2)` is
+  "'int' object is not callable", `for i in 5` is "not iterable".
+  Tests tests/control.cpp incl. the sum-0..4 checkpoint.
+
 ## Risks
 
 Constexpr budget blowups (mitigations: LL(1) not Earley, loops not recursion

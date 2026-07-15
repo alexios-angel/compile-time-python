@@ -37,6 +37,7 @@ CTPY_EXPORT enum class Kind : unsigned char {
 	int_,
 	float_,
 	str,
+	range,
 	tuple,
 	list,
 	set,
@@ -53,6 +54,7 @@ CTPY_EXPORT constexpr std::string_view type_name(Kind kind) noexcept {
 		case Kind::int_: return "int";
 		case Kind::float_: return "float";
 		case Kind::str: return "str";
+		case Kind::range: return "range";
 		case Kind::tuple: return "tuple";
 		case Kind::list: return "list";
 		case Kind::set: return "set";
@@ -68,6 +70,7 @@ CTPY_EXPORT constexpr std::string_view type_name(Kind kind) noexcept {
 //   boolean/int_  i                       (True is i==1)
 //   float_        f
 //   str           [first, first+count) of Arena::chars
+//   range         [first, first+3) of Arena::objs are the start/stop/step ints
 //   tuple/list/set[first, first+count) of Arena::objs
 //   dict          [first, first+count) of Arena::pairs
 //   function      first = def index (M5)
@@ -125,6 +128,18 @@ struct Arena {
 	ctc::vector<Binding, Frames> frames{}; // all bindings: globals, then LIFO frame locals
 	ctc::vector<char, Out> out{};          // captured stdout (print writes here)
 };
+
+namespace detail {
+
+// len(range(start, stop, step)) - step is never 0 (range() raises first)
+constexpr long long range_len(long long start, long long stop, long long step) noexcept {
+	if (step > 0) {
+		return start < stop ? (stop - start + step - 1) / step : 0;
+	}
+	return start > stop ? (start - stop - step - 1) / (-step) : 0;
+}
+
+} // namespace detail
 
 // --- Python exceptions (soft channel - NEVER C++ exceptions) -------------
 
@@ -296,6 +311,10 @@ CTPY_EXPORT template <typename ArenaT = Arena<>> struct State {
 			case Kind::list:
 			case Kind::set:
 			case Kind::dict: return object.count != 0;
+			case Kind::range:
+				return detail::range_len(a.objs[object.first].i,
+				                         a.objs[object.first + 1].i,
+				                         a.objs[object.first + 2].i) != 0;
 			case Kind::function: return true;
 		}
 		return true;

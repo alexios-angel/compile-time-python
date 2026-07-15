@@ -19,7 +19,8 @@
 // AST. eval<Node>(state) returns the OBJECT-POOL INDEX of the result;
 // a Python exception sets state.raised + state.error and every
 // subsequent step short-circuits to None (NEVER C++ exceptions).
-// Statement execution (exec<Stmt> and Flow signals) lands in M4.
+// Statement execution (exec<Stmt> and the Flow signals) lives in
+// exec.hpp; builtin calls (range for now) dispatch in builtins.hpp.
 //
 // Python semantics implemented here, deliberately:
 //   - `/` is true division (always float), `//` floors, `%` takes the
@@ -284,6 +285,18 @@ template <typename St> constexpr bool object_eq(const St & st, std::uint32_t li,
 			}
 			return true;
 		}
+		case Kind::range: {
+			// CPython compares ranges as the sequences they denote
+			const long long lhs_start = st.a.objs[lhs.first].i;
+			const long long rhs_start = st.a.objs[rhs.first].i;
+			const long long lhs_step = st.a.objs[lhs.first + 2].i;
+			const long long rhs_step = st.a.objs[rhs.first + 2].i;
+			const long long length = range_len(lhs_start, st.a.objs[lhs.first + 1].i, lhs_step);
+			if (length != range_len(rhs_start, st.a.objs[rhs.first + 1].i, rhs_step)) {
+				return false;
+			}
+			return length == 0 || (lhs_start == rhs_start && (length == 1 || lhs_step == rhs_step));
+		}
 		default: return false; // set/dict equality lands with M6
 	}
 }
@@ -333,6 +346,29 @@ template <typename St> constexpr bool contains(St & st, std::uint32_t li, std::u
 				}
 			}
 			return false;
+		}
+		case Kind::range: {
+			// arithmetic membership - no iteration needed
+			const Object & needle = st.a.objs[li];
+			if (!is_num(needle.kind)) {
+				return false;
+			}
+			long long value = 0;
+			if (needle.kind == Kind::float_) {
+				if (floor_d(needle.f) != needle.f) {
+					return false;
+				}
+				value = static_cast<long long>(needle.f);
+			} else {
+				value = needle.i;
+			}
+			const long long start = st.a.objs[haystack.first].i;
+			const long long stop = st.a.objs[haystack.first + 1].i;
+			const long long step = st.a.objs[haystack.first + 2].i;
+			if (step > 0) {
+				return value >= start && value < stop && (value - start) % step == 0;
+			}
+			return value <= start && value > stop && (start - value) % (-step) == 0;
 		}
 		default:
 			st.raise_error(ex_kind::TypeError,
@@ -609,8 +645,9 @@ template <typename St> constexpr std::uint32_t unary_op(St & st, uop op, std::ui
 
 template <typename Node, typename St> constexpr std::uint32_t eval_node(St & st);
 
-// no specialization = the node kind is not evaluable yet: containers
-// land in M6, calls/subscripts in M5/M6, f-strings in M7
+// no specialization = the node kind is not evaluable yet: set/dict
+// displays and subscripts land in M6, user-function calls in M5,
+// f-strings in M7 (builtin name calls are specialized in builtins.hpp)
 template <typename Node> struct evaluator {
 	static_assert(sizeof(Node) == 0, "ctpy: this AST node kind is not evaluable yet (later milestone)");
 };
@@ -653,6 +690,42 @@ template <typename Text> struct evaluator<ast::name<Text>> {
 			return st.raise_error(ex_kind::NameError, {"name '", Text::view(), "' is not defined"});
 		}
 		return found;
+	}
+};
+
+// evaluate a display's elements (results scatter through the pool as
+// subexpressions allocate), then copy the element OBJECTS into one
+// contiguous run so the container can be an index-range. Copies share
+// their char/child ranges - the pools are append-only, nothing moves.
+template <Kind ContainerKind, typename... Es, typename St>
+constexpr std::uint32_t make_sequence(St & st) {
+	std::uint32_t items[sizeof...(Es) + 1]{};
+	std::size_t at = 0;
+	const bool complete = ((items[at++] = eval_node<Es, St>(st), !st.raised) && ...);
+	(void)complete;
+	(void)at;
+	if (st.raised) {
+		return st.none();
+	}
+	const std::uint32_t first = static_cast<std::uint32_t>(st.a.objs.size());
+	for (std::size_t element = 0; element < sizeof...(Es); ++element) {
+		st.a.objs.push_back(st.a.objs[items[element]]);
+	}
+	return st.push(Object{.kind = ContainerKind,
+	                      .first = first,
+	                      .count = static_cast<std::uint32_t>(sizeof...(Es))});
+}
+
+// tuple/list displays are already needed by M4 (tuple unpacking and
+// for-iteration); the other displays and all indexing land in M6
+template <typename... Es> struct evaluator<ast::tuple_expr<Es...>> {
+	template <typename St> static constexpr std::uint32_t run(St & st) {
+		return make_sequence<Kind::tuple, Es...>(st);
+	}
+};
+template <typename... Es> struct evaluator<ast::list_expr<Es...>> {
+	template <typename St> static constexpr std::uint32_t run(St & st) {
+		return make_sequence<Kind::list, Es...>(st);
 	}
 };
 
