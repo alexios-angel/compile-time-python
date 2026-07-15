@@ -5,8 +5,9 @@ quom 4.0.2 fails to deduplicate this repo's include graph (it re-inlines
 headers until the output runs away — the same failure notre documents).
 This does the one thing needed: recursively inline every `#include "..."`
 exactly once per resolved path, keep `<system>` includes as-is, and drop
-the local include guards (each file is emitted once, so they are dead
-weight in the amalgam).
+the INLINED files' include guards (each file is emitted once, so they are
+dead weight in the amalgam). The ENTRY header keeps its guard: everything
+inlines inside it, so it becomes the whole amalgam's include guard.
 
 Usage: tools/amalgamate.py <entry-header> <output> [-I include-dir]
 """
@@ -34,16 +35,17 @@ def amalgamate(entry: Path, include_dirs: list[Path]) -> str:
                 return candidate
         return None
 
-    def emit(path: Path) -> None:
+    def emit(path: Path, keep_guard: bool = False) -> None:
         if path in seen:
             return
         seen.add(path)
         text = path.read_text(encoding="utf-8")
         lines = text.splitlines()
         # drop the include guard: the first `#ifndef X` immediately
-        # followed by `#define X`, and the last `#endif`
+        # followed by `#define X`, and the last `#endif` - except for the
+        # entry header, whose guard must survive to guard the amalgam
         guard = None
-        if len(lines) >= 2:
+        if not keep_guard and len(lines) >= 2:
             first = next((i for i, l in enumerate(lines) if l.strip()), None)
             if first is not None and first + 1 < len(lines):
                 m1 = re.match(r"^\s*#\s*ifndef\s+(\w+)\s*$", lines[first])
@@ -69,7 +71,7 @@ def amalgamate(entry: Path, include_dirs: list[Path]) -> str:
             else:
                 out.append(line)
 
-    emit(entry.resolve())
+    emit(entry.resolve(), keep_guard=True)
     return "\n".join(out) + "\n"
 
 

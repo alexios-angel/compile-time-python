@@ -219,8 +219,8 @@ the License, but only in their entirety and only with respect to the Combined
 Software.
 */
 // --- ctpy.hpp (from include/) ---
-
-
+#ifndef CTPY__HPP
+#define CTPY__HPP
 
 // ctpy: compile-time Python. Your script runs while your code compiles:
 //
@@ -13278,4 +13278,4 @@ inline constexpr module_t<Src, ArenaT> module{};
 
 
 
-
+#endif
