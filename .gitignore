@@ -1,0 +1,6 @@
+*.o
+*.d
+build/
+.claude
+*.pch
+*.gch

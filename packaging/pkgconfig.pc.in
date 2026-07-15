@@ -1,0 +1,10 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: @PROJECT_NAME@
+Description: @PROJECT_DESCRIPTION@
+Version: @PROJECT_VERSION@
+# a constexpr Earley parse needs more evaluation budget than compiler
+# defaults; add for clang: -fconstexpr-steps=500000000
+#         or for gcc:   -fconstexpr-ops-limit=3000000000 -fconstexpr-loop-limit=10000000
+Cflags: -I${includedir}

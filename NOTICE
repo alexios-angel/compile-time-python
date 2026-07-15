@@ -1,0 +1,38 @@
+compile-time-python (ctpy)
+Copyright 2026 Alexios Angel
+
+This library is a derivative work built on several projects:
+
+1. The CTLL compile-time LL(1) parser (include/ctll/) originates from
+   the CTRE project, compile-time-regular-expressions, by Hana
+   Dusikova (https://github.com/hanickadot/compile-time-regular-expressions),
+   used here via the notre fork
+   (https://github.com/alexios-angel/notre). CTRE and CTLL are
+   licensed under the Apache License 2.0 with LLVM Exceptions; Hana
+   Dusikova retains authorship of that code.
+
+2. The constexpr containers (include/ctc/) are vendored from
+   compile-time-containers
+   (https://github.com/alexios-angel/compile-time-containers),
+   MIT licensed. The MIT terms and copyright notice for those files
+   are preserved in that project's LICENSE and apply to the
+   include/ctc/ copies distributed here.
+
+3. The LL(1) parse table include/ctpy/python.hpp is generated from
+   include/ctpy/python.lark by Tablewright
+   (https://github.com/alexios-angel/Tablewright), an open-source
+   replacement for the closed-source desatomat tool used by upstream
+   CTRE.
+
+4. The Python language it interprets is defined by the Python Software
+   Foundation (https://www.python.org). ctpy is an independent,
+   from-scratch compile-time implementation of a subset of the
+   language; it contains no CPython source code.
+
+5. The architecture - a Tablewright-generated CTLL table driving
+   type-stack semantic actions - is shared with the sibling projects
+   compile-time-lark, compile-time-json, compile-time-json5,
+   compile-time-yaml and compile-time-xml (github.com/alexios-angel).
+
+compile-time-python is distributed under the Apache License 2.0 with
+LLVM Exceptions, the same license as CTRE; see LICENSE.
