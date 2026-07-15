@@ -20,7 +20,8 @@
 // a Python exception sets state.raised + state.error and every
 // subsequent step short-circuits to None (NEVER C++ exceptions).
 // Statement execution (exec<Stmt> and the Flow signals) lives in
-// exec.hpp; builtin calls (range for now) dispatch in builtins.hpp.
+// exec.hpp; calls (builtins, def'd functions, methods) dispatch in
+// builtins.hpp.
 //
 // Python semantics implemented here, deliberately:
 //   - `/` is true division (always float), `//` floors, `%` takes the
@@ -253,6 +254,65 @@ constexpr double to_double(const Object & object) noexcept {
 	return object.kind == Kind::float_ ? object.f : static_cast<double>(object.i);
 }
 
+// Python hashability: the mutable containers are unhashable, a tuple is
+// hashable only if every element is (used by set displays + dict keys)
+template <typename St> constexpr bool hashable(const St & st, std::uint32_t index) noexcept {
+	const Object & object = st.a.objs[index];
+	switch (object.kind) {
+		case Kind::list:
+		case Kind::set:
+		case Kind::dict:
+			return false;
+		case Kind::tuple: {
+			for (std::uint32_t at = 0; at < object.count; ++at) {
+				if (!hashable(st, object.first + at)) {
+					return false;
+				}
+			}
+			return true;
+		}
+		default:
+			return true;
+	}
+}
+
+// --- iteration over the sequence kinds (shared by for, unpacking, len,
+// indexing - str and range mint fresh objects, the container kinds are
+// already pool slots) -----------------------------------------------------
+
+constexpr bool iterable_kind(Kind kind) noexcept {
+	return kind == Kind::str || kind == Kind::range || kind == Kind::tuple ||
+	       kind == Kind::list || kind == Kind::set || kind == Kind::dict;
+}
+
+template <typename St> constexpr long long iter_len(const St & st, const Object & sequence) noexcept {
+	if (sequence.kind == Kind::range) {
+		return range_len(st.a.objs[sequence.first].i,
+		                 st.a.objs[sequence.first + 1].i,
+		                 st.a.objs[sequence.first + 2].i);
+	}
+	return static_cast<long long>(sequence.count);
+}
+
+// the object (index) of element `at`; a dict iterates its KEYS in
+// insertion order. `sequence` must be a caller-held COPY - the pool
+// grows underneath a live loop.
+template <typename St> constexpr std::uint32_t iter_get(St & st, const Object & sequence, long long at) {
+	switch (sequence.kind) {
+		case Kind::str:
+			return st.make_str(st.str_of(sequence).substr(static_cast<std::size_t>(at), 1));
+		case Kind::range: {
+			const long long start = st.a.objs[sequence.first].i;
+			const long long step = st.a.objs[sequence.first + 2].i;
+			return st.make_int(start + at * step);
+		}
+		case Kind::dict:
+			return st.a.pairs[sequence.first + static_cast<std::uint32_t>(at)].key;
+		default: // tuple/list/set: a contiguous run of pool slots
+			return sequence.first + static_cast<std::uint32_t>(at);
+	}
+}
+
 // --- the generic value-level operations ----------------------------------------
 
 // Python == : deep structural equality; the numeric kinds compare by
@@ -297,7 +357,42 @@ template <typename St> constexpr bool object_eq(const St & st, std::uint32_t li,
 			}
 			return length == 0 || (lhs_start == rhs_start && (length == 1 || lhs_step == rhs_step));
 		}
-		default: return false; // set/dict equality lands with M6
+		case Kind::set: {
+			// order-insensitive: same size, every element present in rhs
+			if (lhs.count != rhs.count) {
+				return false;
+			}
+			for (std::uint32_t at = 0; at < lhs.count; ++at) {
+				bool found = false;
+				for (std::uint32_t other = 0; other < rhs.count && !found; ++other) {
+					found = object_eq(st, lhs.first + at, rhs.first + other);
+				}
+				if (!found) {
+					return false;
+				}
+			}
+			return true;
+		}
+		case Kind::dict: {
+			// same size, every lhs key present in rhs with an equal value
+			if (lhs.count != rhs.count) {
+				return false;
+			}
+			for (std::uint32_t at = 0; at < lhs.count; ++at) {
+				const Pair & entry = st.a.pairs[lhs.first + at];
+				bool found = false;
+				for (std::uint32_t other = 0; other < rhs.count && !found; ++other) {
+					const Pair & candidate = st.a.pairs[rhs.first + other];
+					found = object_eq(st, entry.key, candidate.key) &&
+					        object_eq(st, entry.value, candidate.value);
+				}
+				if (!found) {
+					return false;
+				}
+			}
+			return true;
+		}
+		default: return false; // distinct function objects are unequal
 	}
 }
 
@@ -316,8 +411,8 @@ template <typename St> constexpr bool identical(const St & st, std::uint32_t li,
 	return lhs.kind == Kind::none || (lhs.kind == Kind::boolean && lhs.i == rhs.i);
 }
 
-// Python `in`: substring for str, element for the container kinds
-// (containers themselves land in M6, the ranges are already walkable)
+// Python `in`: substring for str, element for the container kinds,
+// KEY for dict; set/dict membership needs a hashable needle
 template <typename St> constexpr bool contains(St & st, std::uint32_t li, std::uint32_t ri) {
 	const Object & haystack = st.a.objs[ri];
 	switch (haystack.kind) {
@@ -332,6 +427,11 @@ template <typename St> constexpr bool contains(St & st, std::uint32_t li, std::u
 		case Kind::tuple:
 		case Kind::list:
 		case Kind::set: {
+			if (haystack.kind == Kind::set && !hashable(st, li)) {
+				st.raise_error(ex_kind::TypeError,
+					{"unhashable type: '", type_name(st.a.objs[li].kind), "'"});
+				return false;
+			}
 			for (std::uint32_t at = 0; at < haystack.count; ++at) {
 				if (object_eq(st, li, haystack.first + at)) {
 					return true;
@@ -340,6 +440,11 @@ template <typename St> constexpr bool contains(St & st, std::uint32_t li, std::u
 			return false;
 		}
 		case Kind::dict: {
+			if (!hashable(st, li)) {
+				st.raise_error(ex_kind::TypeError,
+					{"unhashable type: '", type_name(st.a.objs[li].kind), "'"});
+				return false;
+			}
 			for (std::uint32_t at = 0; at < haystack.count; ++at) {
 				if (object_eq(st, li, st.a.pairs[haystack.first + at].key)) {
 					return true;
@@ -641,13 +746,263 @@ template <typename St> constexpr std::uint32_t unary_op(St & st, uop op, std::ui
 		{"bad operand type for unary ", uop_symbol(op), ": '", type_name(value.kind), "'"});
 }
 
+// --- subscripts: a[i], a[i:j:k], stores, and the append realloc -----------------
+
+// a lazy range object: start/stop/step live as three pool ints (also
+// minted by the range() builtin and by slicing a range)
+template <typename St>
+constexpr std::uint32_t make_range(St & st, long long start, long long stop, long long step) {
+	const std::uint32_t first = static_cast<std::uint32_t>(st.a.objs.size());
+	st.make_int(start);
+	st.make_int(stop);
+	st.make_int(step);
+	return st.push(Object{.kind = Kind::range, .first = first, .count = 3});
+}
+
+// append a shallow repr of a key to the in-flight error (KeyError spells
+// the missing key the way a traceback would)
+template <typename St> constexpr void append_repr(St & st, std::uint32_t index) noexcept {
+	const Object & object = st.a.objs[index];
+	switch (object.kind) {
+		case Kind::none:
+			st.error.append("None");
+			break;
+		case Kind::boolean:
+			st.error.append(object.i != 0 ? "True" : "False");
+			break;
+		case Kind::int_:
+			st.error.append(dec(object.i).view());
+			break;
+		case Kind::str:
+			st.error.append("'").append(st.str_of(object)).append("'");
+			break;
+		default:
+			st.error.append("<").append(type_name(object.kind)).append(">");
+			break;
+	}
+}
+
+// the IndexError spellings, per CPython
+constexpr std::string_view index_error_message(Kind kind) noexcept {
+	switch (kind) {
+		case Kind::str: return "string index out of range";
+		case Kind::tuple: return "tuple index out of range";
+		case Kind::range: return "range object index out of range";
+		default: return "list index out of range";
+	}
+}
+
+// a[key] - negative indices count from the end, a dict looks its key up
+// by equality (insertion order), a missing key is a KeyError
+template <typename St>
+constexpr std::uint32_t subscript_load(St & st, std::uint32_t oi, std::uint32_t ki) {
+	const Object container = st.a.objs[oi]; // copies: the pool below may grow
+	const Object key = st.a.objs[ki];
+	switch (container.kind) {
+		case Kind::dict: {
+			if (!hashable(st, ki)) {
+				return st.raise_error(ex_kind::TypeError,
+					{"unhashable type: '", type_name(key.kind), "'"});
+			}
+			for (std::uint32_t at = 0; at < container.count; ++at) {
+				if (object_eq(st, ki, st.a.pairs[container.first + at].key)) {
+					return st.a.pairs[container.first + at].value;
+				}
+			}
+			st.raise_error(ex_kind::KeyError, {});
+			append_repr(st, ki);
+			return st.none();
+		}
+		case Kind::str:
+		case Kind::tuple:
+		case Kind::list:
+		case Kind::range: {
+			if (!is_int_like(key.kind)) {
+				if (container.kind == Kind::str) {
+					return st.raise_error(ex_kind::TypeError,
+						{"string indices must be integers, not '", type_name(key.kind), "'"});
+				}
+				return st.raise_error(ex_kind::TypeError,
+					{type_name(container.kind), " indices must be integers or slices, not ",
+					 type_name(key.kind)});
+			}
+			const long long length = iter_len(st, container);
+			long long at = key.i;
+			if (at < 0) {
+				at += length;
+			}
+			if (at < 0 || at >= length) {
+				return st.raise_error(ex_kind::IndexError, index_error_message(container.kind));
+			}
+			return iter_get(st, container, at);
+		}
+		default:
+			return st.raise_error(ex_kind::TypeError,
+				{"'", type_name(container.kind), "' object is not subscriptable"});
+	}
+}
+
+// a[i:j:k] with Python's clamp rules (PySlice_AdjustIndices): absent or
+// None bounds take direction-dependent defaults, out-of-range bounds
+// clamp instead of raising, a zero step is a ValueError. str slices
+// share the char pool walk, tuple/list copy an element run, a range
+// slice is a new lazy range.
+template <typename St>
+constexpr std::uint32_t slice_load(St & st, std::uint32_t oi,
+                                   bool has_start, long long start,
+                                   bool has_stop, long long stop,
+                                   bool has_step, long long step) {
+	const Object sequence = st.a.objs[oi]; // copy: the pool below may grow
+	if (sequence.kind == Kind::dict) {
+		return st.raise_error(ex_kind::TypeError, "unhashable type: 'slice'");
+	}
+	if (sequence.kind != Kind::str && sequence.kind != Kind::tuple &&
+	    sequence.kind != Kind::list && sequence.kind != Kind::range) {
+		return st.raise_error(ex_kind::TypeError,
+			{"'", type_name(sequence.kind), "' object is not subscriptable"});
+	}
+	if (!has_step) {
+		step = 1;
+	}
+	if (step == 0) {
+		return st.raise_error(ex_kind::ValueError, "slice step cannot be zero");
+	}
+	const long long length = iter_len(st, sequence);
+	if (!has_start) {
+		start = step < 0 ? length - 1 : 0;
+	} else if (start < 0) {
+		start += length;
+		if (start < 0) {
+			start = step < 0 ? -1 : 0;
+		}
+	} else if (start >= length) {
+		start = step < 0 ? length - 1 : length;
+	}
+	if (!has_stop) {
+		stop = step < 0 ? -1 : length;
+	} else if (stop < 0) {
+		stop += length;
+		if (stop < 0) {
+			stop = step < 0 ? -1 : 0;
+		}
+	} else if (stop >= length) {
+		stop = step < 0 ? length - 1 : length;
+	}
+	long long count = 0;
+	if (step > 0) {
+		count = start < stop ? (stop - start - 1) / step + 1 : 0;
+	} else {
+		count = stop < start ? (start - stop - 1) / (-step) + 1 : 0;
+	}
+	switch (sequence.kind) {
+		case Kind::str: {
+			const std::uint32_t out = st.make_str_here();
+			for (long long at = 0; at < count; ++at) {
+				st.str_push(out, st.a.chars[static_cast<std::size_t>(
+					sequence.first + static_cast<std::uint32_t>(start + at * step))]);
+			}
+			return out;
+		}
+		case Kind::range: {
+			const long long range_start = st.a.objs[sequence.first].i;
+			const long long range_step = st.a.objs[sequence.first + 2].i;
+			const long long new_start = range_start + start * range_step;
+			const long long new_step = range_step * step;
+			return make_range(st, new_start, new_start + count * new_step, new_step);
+		}
+		default: { // tuple/list: copy the selected elements into a fresh run
+			const std::uint32_t first = static_cast<std::uint32_t>(st.a.objs.size());
+			for (long long at = 0; at < count; ++at) {
+				st.a.objs.push_back(st.a.objs[sequence.first + static_cast<std::uint32_t>(start + at * step)]);
+			}
+			return st.push(Object{.kind = sequence.kind,
+			                      .first = first,
+			                      .count = static_cast<std::uint32_t>(count)});
+		}
+	}
+}
+
+// a[key] = value. The arena is append-only, so mutation follows the
+// REALLOC pattern (PLAN.md 4.3): a list element store overwrites its
+// run slot in place; a NEW dict key copies the pair run to the end of
+// the pair pool, appends, and repoints the dict object - old runs stay
+// behind as garbage (no GC; one right-sizing pass copies results out).
+// Known v0.1 aliasing deviation: containers hold shallow COPIES of
+// their element objects, so mutating a list that was previously stored
+// INSIDE another container does not update the outer copy.
+template <typename St>
+constexpr void subscript_store(St & st, std::uint32_t oi, std::uint32_t ki, std::uint32_t vi) {
+	const Object container = st.a.objs[oi];
+	const Object key = st.a.objs[ki];
+	switch (container.kind) {
+		case Kind::list: {
+			if (!is_int_like(key.kind)) {
+				st.raise_error(ex_kind::TypeError,
+					{"list indices must be integers or slices, not ", type_name(key.kind)});
+				return;
+			}
+			long long at = key.i;
+			if (at < 0) {
+				at += static_cast<long long>(container.count);
+			}
+			if (at < 0 || at >= static_cast<long long>(container.count)) {
+				st.raise_error(ex_kind::IndexError, "list assignment index out of range");
+				return;
+			}
+			st.a.objs[container.first + static_cast<std::uint32_t>(at)] = st.a.objs[vi];
+			return;
+		}
+		case Kind::dict: {
+			if (!hashable(st, ki)) {
+				st.raise_error(ex_kind::TypeError,
+					{"unhashable type: '", type_name(key.kind), "'"});
+				return;
+			}
+			for (std::uint32_t at = 0; at < container.count; ++at) {
+				if (object_eq(st, ki, st.a.pairs[container.first + at].key)) {
+					st.a.pairs[container.first + at].value = vi;
+					return;
+				}
+			}
+			// new key: realloc the pair run, repoint the dict in place
+			const std::uint32_t first = static_cast<std::uint32_t>(st.a.pairs.size());
+			for (std::uint32_t at = 0; at < container.count; ++at) {
+				st.a.pairs.push_back(st.a.pairs[container.first + at]);
+			}
+			st.a.pairs.push_back(Pair{ki, vi});
+			st.a.objs[oi].first = first;
+			st.a.objs[oi].count = container.count + 1;
+			return;
+		}
+		default: // tuple/str immutability and non-containers spell the same TypeError
+			st.raise_error(ex_kind::TypeError,
+				{"'", type_name(container.kind), "' object does not support item assignment"});
+			return;
+	}
+}
+
+// list.append: the same realloc pattern - copy the element run plus the
+// new element to the end of the pool, repoint the list object IN PLACE
+// so every reference to its pool slot sees the mutation
+template <typename St> constexpr void list_append(St & st, std::uint32_t li, std::uint32_t vi) {
+	const Object list = st.a.objs[li];
+	const std::uint32_t first = static_cast<std::uint32_t>(st.a.objs.size());
+	for (std::uint32_t at = 0; at < list.count; ++at) {
+		st.a.objs.push_back(st.a.objs[list.first + at]);
+	}
+	st.a.objs.push_back(st.a.objs[vi]);
+	st.a.objs[li].first = first;
+	st.a.objs[li].count = list.count + 1;
+}
+
 // --- the tree-walk -------------------------------------------------------------
 
 template <typename Node, typename St> constexpr std::uint32_t eval_node(St & st);
 
-// no specialization = the node kind is not evaluable yet: set/dict
-// displays and subscripts land in M6, user-function calls in M5,
-// f-strings in M7 (builtin name calls are specialized in builtins.hpp)
+// no specialization = the node kind is not evaluable yet: f-strings
+// land in M7, bare method references (an attribute_expr that is not
+// immediately called) are out of the v0.1 subset (call dispatch is
+// specialized in builtins.hpp)
 template <typename Node> struct evaluator {
 	static_assert(sizeof(Node) == 0, "ctpy: this AST node kind is not evaluable yet (later milestone)");
 };
@@ -716,8 +1071,6 @@ constexpr std::uint32_t make_sequence(St & st) {
 	                      .count = static_cast<std::uint32_t>(sizeof...(Es))});
 }
 
-// tuple/list displays are already needed by M4 (tuple unpacking and
-// for-iteration); the other displays and all indexing land in M6
 template <typename... Es> struct evaluator<ast::tuple_expr<Es...>> {
 	template <typename St> static constexpr std::uint32_t run(St & st) {
 		return make_sequence<Kind::tuple, Es...>(st);
@@ -726,6 +1079,157 @@ template <typename... Es> struct evaluator<ast::tuple_expr<Es...>> {
 template <typename... Es> struct evaluator<ast::list_expr<Es...>> {
 	template <typename St> static constexpr std::uint32_t run(St & st) {
 		return make_sequence<Kind::list, Es...>(st);
+	}
+};
+
+// a set display dedupes by equality, keeping the FIRST occurrence
+// (insertion order - v0.1 sets are insertion-ordered element runs)
+template <typename... Es> struct evaluator<ast::set_expr<Es...>> {
+	template <typename St> static constexpr std::uint32_t run(St & st) {
+		std::uint32_t items[sizeof...(Es) + 1]{};
+		std::size_t at = 0;
+		const bool complete = ((items[at++] = eval_node<Es, St>(st), !st.raised) && ...);
+		(void)complete;
+		(void)at;
+		if (st.raised) {
+			return st.none();
+		}
+		const std::uint32_t first = static_cast<std::uint32_t>(st.a.objs.size());
+		std::uint32_t kept = 0;
+		for (std::size_t element = 0; element < sizeof...(Es); ++element) {
+			if (!hashable(st, items[element])) {
+				return st.raise_error(ex_kind::TypeError,
+					{"unhashable type: '", type_name(st.a.objs[items[element]].kind), "'"});
+			}
+			bool duplicate = false;
+			for (std::uint32_t seen = 0; seen < kept && !duplicate; ++seen) {
+				duplicate = object_eq(st, items[element], first + seen);
+			}
+			if (!duplicate) {
+				st.a.objs.push_back(st.a.objs[items[element]]);
+				++kept;
+			}
+		}
+		return st.push(Object{.kind = Kind::set, .first = first, .count = kept});
+	}
+};
+
+// one dict display item: key evaluates before its value, in source order
+template <typename Item> struct dict_item_eval;
+template <typename K, typename V> struct dict_item_eval<ast::dict_item<K, V>> {
+	template <typename St>
+	static constexpr bool run(St & st, std::uint32_t * keys, std::uint32_t * values, std::size_t & used) {
+		keys[used] = eval_node<K, St>(st);
+		if (st.raised) {
+			return false;
+		}
+		values[used] = eval_node<V, St>(st);
+		++used;
+		return !st.raised;
+	}
+};
+
+// a dict display keeps insertion order; a duplicate key overwrites the
+// value in place but keeps its original position (CPython semantics)
+template <typename... Items> struct evaluator<ast::dict_expr<Items...>> {
+	template <typename St> static constexpr std::uint32_t run(St & st) {
+		std::uint32_t keys[sizeof...(Items) + 1]{};
+		std::uint32_t values[sizeof...(Items) + 1]{};
+		std::size_t used = 0;
+		const bool complete = (dict_item_eval<Items>::run(st, keys, values, used) && ...);
+		(void)complete;
+		(void)used;
+		if (st.raised) {
+			return st.none();
+		}
+		const std::uint32_t first = static_cast<std::uint32_t>(st.a.pairs.size());
+		std::uint32_t kept = 0;
+		for (std::size_t item = 0; item < sizeof...(Items); ++item) {
+			if (!hashable(st, keys[item])) {
+				return st.raise_error(ex_kind::TypeError,
+					{"unhashable type: '", type_name(st.a.objs[keys[item]].kind), "'"});
+			}
+			bool replaced = false;
+			for (std::uint32_t seen = 0; seen < kept && !replaced; ++seen) {
+				if (object_eq(st, keys[item], st.a.pairs[first + seen].key)) {
+					st.a.pairs[first + seen].value = values[item];
+					replaced = true;
+				}
+			}
+			if (!replaced) {
+				st.a.pairs.push_back(Pair{keys[item], values[item]});
+				++kept;
+			}
+		}
+		return st.push(Object{.kind = Kind::dict, .first = first, .count = kept});
+	}
+};
+
+// a[key]
+template <typename Obj, typename Index> struct evaluator<ast::subscript_expr<Obj, Index>> {
+	template <typename St> static constexpr std::uint32_t run(St & st) {
+		const std::uint32_t object = eval_node<Obj, St>(st);
+		if (st.raised) {
+			return st.none();
+		}
+		const std::uint32_t key = eval_node<Index, St>(st);
+		if (st.raised) {
+			return st.none();
+		}
+		return subscript_load(st, object, key);
+	}
+};
+
+// one slice bound: void (absent in the source) and None both mean
+// "default"; anything else must be an integer
+template <typename E, typename St>
+constexpr bool eval_slice_bound(St & st, long long & value, bool & present) {
+	if constexpr (std::is_void_v<E>) {
+		(void)st;
+		(void)value;
+		present = false;
+		return true;
+	} else {
+		const std::uint32_t index = eval_node<E, St>(st);
+		if (st.raised) {
+			return false;
+		}
+		const Object & object = st.a.objs[index];
+		if (object.kind == Kind::none) {
+			present = false;
+			return true;
+		}
+		if (!is_int_like(object.kind)) {
+			st.raise_error(ex_kind::TypeError,
+				"slice indices must be integers or None or have an __index__ method");
+			return false;
+		}
+		value = object.i;
+		present = true;
+		return true;
+	}
+}
+
+// a[i:j:k]
+template <typename Obj, typename L, typename U, typename S>
+struct evaluator<ast::subscript_expr<Obj, ast::slice_expr<L, U, S>>> {
+	template <typename St> static constexpr std::uint32_t run(St & st) {
+		const std::uint32_t object = eval_node<Obj, St>(st);
+		if (st.raised) {
+			return st.none();
+		}
+		long long start = 0;
+		long long stop = 0;
+		long long step = 0;
+		bool has_start = false;
+		bool has_stop = false;
+		bool has_step = false;
+		if (!eval_slice_bound<L>(st, start, has_start) ||
+		    !eval_slice_bound<U>(st, stop, has_stop) ||
+		    !eval_slice_bound<S>(st, step, has_step)) {
+			return st.none();
+		}
+		return slice_load(st, object, has_start, start, has_stop, stop, has_step, step);
 	}
 };
 

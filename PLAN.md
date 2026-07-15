@@ -300,6 +300,47 @@ manual `cp -R` + `diff -rq` in CLAUDE.md.
   escaping a function body are the same soft SyntaxErrors as at module
   level.
 
+- **M6 containers: DONE.** Container semantics live in eval.hpp
+  (displays, subscript_load/slice_load/subscript_store, list_append,
+  hashable, set/dict equality), exec.hpp (subscript assignment + aug
+  targets) and builtins.hpp (len, method-call dispatch); tests in
+  tests/containers.cpp. Key decisions:
+  - *Mutation = the realloc pattern* (section 4.3, arena append-only):
+    list.append and a NEW dict key copy the element/pair run to the
+    end of the pool plus the addition, then repoint the container
+    Object IN PLACE (same pool slot), so every holder of that index
+    sees the mutation; in-range `lst[i] = x` and existing-key
+    `d[k] = v` overwrite their slot directly. Old runs stay behind as
+    garbage until the M8 right-size. Documented v0.1 aliasing
+    deviation: displays copy element OBJECTS into contiguous runs, so
+    mutating a list AFTER storing it inside another container does not
+    update the outer copy (dict VALUES are pair indices and do alias).
+  - Indexing/slicing/len/for all share one iteration seam
+    (iterable_kind/iter_len/iter_get, moved exec.hpp -> eval.hpp):
+    str indexes/slices via the char pool, range stays lazy (indexing
+    is arithmetic; SLICING a range mints a new lazy range), dict
+    iterates keys in insertion order. Slices follow CPython's
+    PySlice_AdjustIndices clamp rules exactly (None == absent bound;
+    step 0 is ValueError). Negative indices count from the end
+    everywhere.
+  - Sets/dicts are insertion-ordered runs with linear-scan equality
+    lookup (no hashing - fine at compile-time scale); displays dedupe
+    keeping the FIRST key slot, a duplicate dict key updates its value
+    in place (CPython order semantics). Unhashable keys/needles
+    (list/set/dict, tuples containing them) raise TypeError.
+  - Methods dispatch on Kind + name via
+    `call_expr<attribute_expr<Obj, Name>, Args...>` in builtins.hpp:
+    list.append, dict.keys/.values/.items/.get (views materialize as
+    lists; items() lays element runs first, then the tuple headers as
+    one contiguous run that IS the list run). Unknown attribute =
+    AttributeError (added to ex_kind). Bare `d.keys` without the call
+    stays a hard static_assert (no bound-method objects in v0.1).
+  - Slice ASSIGNMENT (`xs[0:2] = ...`) is a soft "ctpy v0.1: slice
+    assignment is not supported" TypeError; tuple/str item assignment
+    is CPython's TypeError; KeyError spells the missing key repr-style
+    via append_repr. detail::dec moved builtins.hpp -> object.hpp so
+    eval.hpp error messages can spell counts.
+
 ## Risks
 
 Constexpr budget blowups (mitigations: LL(1) not Earley, loops not recursion

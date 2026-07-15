@@ -13,17 +13,21 @@
 #include <string_view>
 #endif
 
-// The compile-time builtins. M4 ships only range() - a real lazy range
-// OBJECT (start/stop/step ints in the pool, Kind::range), not a
-// materialized list, so `for i in range(1000)` costs three pool slots,
-// not a thousand. The rest of the v0.1 builtin set (print, len, sum,
-// min, max, abs, str, int, bool, sorted, enumerate, zip) lands in M7.
+// The compile-time builtins and every call site's dispatch. M4 shipped
+// range() - a real lazy range OBJECT (start/stop/step ints in the pool,
+// Kind::range), not a materialized list, so `for i in range(1000)`
+// costs three pool slots, not a thousand. M6 adds len() and the minimal
+// METHOD set (list.append, dict.keys/.values/.items/.get). The rest of
+// the v0.1 builtin set (print, sum, min, max, abs, str, int, bool,
+// sorted, enumerate, zip) lands in M7.
 //
 // Calling a NAME dispatches here: a bound name wins (Python lets you
 // shadow builtins), an unbound one is looked up in the builtin table,
 // anything else is a NameError. A bound FUNCTION object (made by a def
 // statement, exec.hpp) is invoked through its type-erased thunk in
 // State::thunks - this call site never sees the def's AST type.
+// Calling an ATTRIBUTE (obj.method(...)) dispatches on the object's
+// Kind plus the method name - an unknown pair is an AttributeError.
 // Keyword arguments are OUT of the v0.1 call subset (calls are
 // positional-only; a kwarg raises a soft TypeError saying so).
 
@@ -31,38 +35,7 @@ namespace ctpy {
 
 namespace detail {
 
-// spell a small count for an error message ("expected 2, got 3")
-constexpr ctc::string<20> dec(long long value) noexcept {
-	ctc::string<20> out{};
-	unsigned long long magnitude = 0;
-	if (value < 0) {
-		out.push_back('-');
-		magnitude = 0ULL - static_cast<unsigned long long>(value);
-	} else {
-		magnitude = static_cast<unsigned long long>(value);
-	}
-	char digits[20]{};
-	std::size_t used = 0;
-	do {
-		digits[used++] = static_cast<char>('0' + static_cast<char>(magnitude % 10ULL));
-		magnitude /= 10ULL;
-	} while (magnitude != 0);
-	while (used > 0) {
-		out.push_back(digits[--used]);
-	}
-	return out;
-}
-
 // --- range() ---------------------------------------------------------------
-
-template <typename St>
-constexpr std::uint32_t make_range(St & st, long long start, long long stop, long long step) {
-	const std::uint32_t first = static_cast<std::uint32_t>(st.a.objs.size());
-	st.make_int(start);
-	st.make_int(stop);
-	st.make_int(step);
-	return st.push(Object{.kind = Kind::range, .first = first, .count = 3});
-}
 
 template <typename St>
 constexpr std::uint32_t builtin_range(St & st, const std::uint32_t * argv, std::size_t argc) {
@@ -92,10 +65,27 @@ constexpr std::uint32_t builtin_range(St & st, const std::uint32_t * argv, std::
 	return make_range(st, start, stop, step);
 }
 
+// --- len() -------------------------------------------------------------------
+
+template <typename St>
+constexpr std::uint32_t builtin_len(St & st, const std::uint32_t * argv, std::size_t argc) {
+	if (argc != 1) {
+		const auto got = dec(static_cast<long long>(argc));
+		return st.raise_error(ex_kind::TypeError,
+			{"len() takes exactly one argument (", got.view(), " given)"});
+	}
+	const Object & object = st.a.objs[argv[0]];
+	if (!iterable_kind(object.kind)) {
+		return st.raise_error(ex_kind::TypeError,
+			{"object of type '", type_name(object.kind), "' has no len()"});
+	}
+	return st.make_int(iter_len(st, object));
+}
+
 // --- the builtin table -------------------------------------------------------
 
 constexpr bool is_builtin(std::string_view name) noexcept {
-	return name == "range";
+	return name == "range" || name == "len";
 }
 
 template <typename St>
@@ -104,7 +94,88 @@ constexpr std::uint32_t call_builtin(St & st, std::string_view name,
 	if (name == "range") {
 		return builtin_range(st, argv, argc);
 	}
+	if (name == "len") {
+		return builtin_len(st, argv, argc);
+	}
 	return st.raise_error(ex_kind::NameError, {"name '", name, "' is not defined"});
+}
+
+// --- methods (the minimal v0.1 set) --------------------------------------------
+
+// dict.keys()/.values()/.items() return materialized LISTS (v0.1 has no
+// view objects; CPython code that iterates or len()s them works the
+// same). items() lays out the element runs first (key/value copies,
+// pairwise), then the tuple headers as one contiguous run - which IS
+// the list's element run.
+template <typename St>
+constexpr std::uint32_t dict_view_list(St & st, const Object & self, int which) {
+	if (which == 2) {
+		const std::uint32_t base = static_cast<std::uint32_t>(st.a.objs.size());
+		for (std::uint32_t at = 0; at < self.count; ++at) {
+			const Pair entry = st.a.pairs[self.first + at];
+			st.a.objs.push_back(st.a.objs[entry.key]);
+			st.a.objs.push_back(st.a.objs[entry.value]);
+		}
+		const std::uint32_t headers = static_cast<std::uint32_t>(st.a.objs.size());
+		for (std::uint32_t at = 0; at < self.count; ++at) {
+			st.a.objs.push_back(Object{.kind = Kind::tuple, .first = base + 2 * at, .count = 2});
+		}
+		return st.push(Object{.kind = Kind::list, .first = headers, .count = self.count});
+	}
+	const std::uint32_t first = static_cast<std::uint32_t>(st.a.objs.size());
+	for (std::uint32_t at = 0; at < self.count; ++at) {
+		const Pair entry = st.a.pairs[self.first + at];
+		st.a.objs.push_back(st.a.objs[which == 0 ? entry.key : entry.value]);
+	}
+	return st.push(Object{.kind = Kind::list, .first = first, .count = self.count});
+}
+
+template <typename St>
+constexpr std::uint32_t call_method(St & st, std::uint32_t self, std::string_view name,
+                                    const std::uint32_t * argv, std::size_t argc) {
+	const Object object = st.a.objs[self]; // copy: methods below may grow the pool
+	if (object.kind == Kind::list && name == "append") {
+		if (argc != 1) {
+			const auto got = dec(static_cast<long long>(argc));
+			return st.raise_error(ex_kind::TypeError,
+				{"list.append() takes exactly one argument (", got.view(), " given)"});
+		}
+		list_append(st, self, argv[0]);
+		return st.none();
+	}
+	if (object.kind == Kind::dict) {
+		const int which = name == "keys" ? 0 : name == "values" ? 1 : name == "items" ? 2 : -1;
+		if (which >= 0) {
+			if (argc != 0) {
+				const auto got = dec(static_cast<long long>(argc));
+				return st.raise_error(ex_kind::TypeError,
+					{name, "() takes no arguments (", got.view(), " given)"});
+			}
+			return dict_view_list(st, object, which);
+		}
+		if (name == "get") {
+			if (argc < 1) {
+				return st.raise_error(ex_kind::TypeError, "get expected at least 1 argument, got 0");
+			}
+			if (argc > 2) {
+				const auto got = dec(static_cast<long long>(argc));
+				return st.raise_error(ex_kind::TypeError,
+					{"get expected at most 2 arguments, got ", got.view()});
+			}
+			if (!hashable(st, argv[0])) {
+				return st.raise_error(ex_kind::TypeError,
+					{"unhashable type: '", type_name(st.a.objs[argv[0]].kind), "'"});
+			}
+			for (std::uint32_t at = 0; at < object.count; ++at) {
+				if (object_eq(st, argv[0], st.a.pairs[object.first + at].key)) {
+					return st.a.pairs[object.first + at].value;
+				}
+			}
+			return argc == 2 ? argv[1] : st.none();
+		}
+	}
+	return st.raise_error(ex_kind::AttributeError,
+		{"'", type_name(object.kind), "' object has no attribute '", name, "'"});
 }
 
 // --- calling a name -------------------------------------------------------------
@@ -142,6 +213,32 @@ struct evaluator<ast::call_expr<ast::name<Text>, Args...>> {
 				return st.thunks[static_cast<std::size_t>(fn.i)](st, fn, argv, sizeof...(Args));
 			}
 			return call_builtin(st, Text::view(), argv, sizeof...(Args));
+		}
+	}
+};
+
+// --- calling a method: obj.name(args...) --------------------------------------
+
+template <typename Obj, typename NameText, typename... Args>
+struct evaluator<ast::call_expr<ast::attribute_expr<Obj, NameText>, Args...>> {
+	template <typename St> static constexpr std::uint32_t run(St & st) {
+		const std::uint32_t self = eval_node<Obj, St>(st);
+		if (st.raised) {
+			return st.none();
+		}
+		if constexpr ((is_kwarg<Args> || ...)) {
+			return st.raise_error(ex_kind::TypeError,
+				{NameText::view(), "() takes no keyword arguments (ctpy v0.1: calls are positional-only)"});
+		} else {
+			std::uint32_t argv[sizeof...(Args) + 1]{};
+			std::size_t at = 0;
+			const bool complete = ((argv[at++] = eval_node<Args, St>(st), !st.raised) && ...);
+			(void)complete;
+			(void)at;
+			if (st.raised) {
+				return st.none();
+			}
+			return call_method(st, self, NameText::view(), argv, sizeof...(Args));
 		}
 	}
 };

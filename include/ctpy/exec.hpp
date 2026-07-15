@@ -31,8 +31,8 @@
 //     (tuple/list/str/range) with CPython's ValueError messages;
 //   - `while`/`for` else-suites run only when the loop was NOT left
 //     by break;
-//   - for-loops iterate range objects lazily (no materialization) and
-//     str per character;
+//   - for-loops iterate range objects lazily (no materialization), str
+//     per character, dicts over their KEYS in insertion order;
 //   - break/continue/return that escape to module level (or a function
 //     body, for break/continue) are the SyntaxErrors CPython reports
 //     (soft, since the grammar accepts them anywhere);
@@ -71,50 +71,45 @@ template <typename Stmt, typename St> constexpr Flow exec_node(St & st) {
 	return executor<Stmt>::run(st);
 }
 
-// --- iteration over the sequence kinds (str/range/tuple/list) --------------
-
-constexpr bool iterable_kind(Kind kind) noexcept {
-	return kind == Kind::str || kind == Kind::range || kind == Kind::tuple || kind == Kind::list;
-}
-
-template <typename St> constexpr long long iter_len(const St & st, const Object & sequence) noexcept {
-	if (sequence.kind == Kind::range) {
-		return range_len(st.a.objs[sequence.first].i,
-		                 st.a.objs[sequence.first + 1].i,
-		                 st.a.objs[sequence.first + 2].i);
-	}
-	return static_cast<long long>(sequence.count);
-}
-
-// the object (index) of element `at`; str and range mint a fresh
-// object, tuple/list elements are already pool slots. `sequence` must
-// be a caller-held COPY - the pool grows underneath a live loop.
-template <typename St> constexpr std::uint32_t iter_get(St & st, const Object & sequence, long long at) {
-	switch (sequence.kind) {
-		case Kind::str:
-			return st.make_str(st.str_of(sequence).substr(static_cast<std::size_t>(at), 1));
-		case Kind::range: {
-			const long long start = st.a.objs[sequence.first].i;
-			const long long step = st.a.objs[sequence.first + 2].i;
-			return st.make_int(start + at * step);
-		}
-		default: // tuple/list: a contiguous run of pool slots
-			return sequence.first + static_cast<std::uint32_t>(at);
-	}
-}
-
 // --- assignment targets ------------------------------------------------------
 
-// no specialization = the target kind is not assignable yet
-// (subscript/attribute targets land in M6)
+// no specialization = the target kind is not assignable (attribute
+// stores are out of the v0.1 subset - no user objects to store into).
+// The iteration helpers (iterable_kind/iter_len/iter_get) live in
+// eval.hpp since M6 - indexing shares them.
 template <typename Target> struct assign_target {
 	static_assert(sizeof(Target) == 0,
-		"ctpy: assignment to this target kind is not executable yet (later milestone)");
+		"ctpy: assignment to this target kind is not in the v0.1 subset");
 };
 
 template <typename Text> struct assign_target<ast::name<Text>> {
 	template <typename St> static constexpr void run(St & st, std::uint32_t value) {
 		st.bind(Text::view(), value);
+	}
+};
+
+// a[i] = value / d[k] = value (the value is already evaluated - the
+// assign statement evaluates its right side FIRST, then each target's
+// object and index expressions, per CPython)
+template <typename Obj, typename Index> struct assign_target<ast::subscript_expr<Obj, Index>> {
+	template <typename St> static constexpr void run(St & st, std::uint32_t value) {
+		const std::uint32_t object = eval_node<Obj, St>(st);
+		if (st.raised) {
+			return;
+		}
+		const std::uint32_t key = eval_node<Index, St>(st);
+		if (st.raised) {
+			return;
+		}
+		subscript_store(st, object, key, value);
+	}
+};
+
+// slice stores are out of the v0.1 subset (soft error, documented)
+template <typename Obj, typename L, typename U, typename S>
+struct assign_target<ast::subscript_expr<Obj, ast::slice_expr<L, U, S>>> {
+	template <typename St> static constexpr void run(St & st, std::uint32_t) {
+		st.raise_error(ex_kind::TypeError, "ctpy v0.1: slice assignment is not supported");
 	}
 };
 
@@ -216,10 +211,11 @@ template <typename V, typename... Targets> struct executor<ast::assign_stmt<V, T
 	}
 };
 
-// aug-assign; only name targets exist before M6's subscript/attribute stores
+// aug-assign to a name or a subscript (attribute targets are out of
+// the v0.1 subset)
 template <typename Op, typename Target, typename V> struct aug_exec {
 	static_assert(sizeof(Target) == 0,
-		"ctpy: aug-assign to this target kind is not executable yet (later milestone)");
+		"ctpy: aug-assign to this target kind is not in the v0.1 subset");
 };
 template <typename Op, typename Text, typename V> struct aug_exec<Op, ast::name<Text>, V> {
 	template <typename St> static constexpr Flow run(St & st) {
@@ -239,6 +235,44 @@ template <typename Op, typename Text, typename V> struct aug_exec<Op, ast::name<
 		return Flow::next;
 	}
 };
+// a[i] += v: evaluate the object and index ONCE, load, evaluate the
+// right side, operate, store back through the same object/index
+template <typename Op, typename Obj, typename Index, typename V>
+struct aug_exec<Op, ast::subscript_expr<Obj, Index>, V> {
+	template <typename St> static constexpr Flow run(St & st) {
+		const std::uint32_t object = eval_node<Obj, St>(st);
+		if (st.raised) {
+			return Flow::next;
+		}
+		const std::uint32_t key = eval_node<Index, St>(st);
+		if (st.raised) {
+			return Flow::next;
+		}
+		const std::uint32_t current = subscript_load(st, object, key);
+		if (st.raised) {
+			return Flow::next;
+		}
+		const std::uint32_t value = eval_node<V, St>(st);
+		if (st.raised) {
+			return Flow::next;
+		}
+		const std::uint32_t result = bin_op(st, bop_of<Op>::value, current, value);
+		if (!st.raised) {
+			subscript_store(st, object, key, result);
+		}
+		return Flow::next;
+	}
+};
+
+// aug-assign through a slice is out of the v0.1 subset, like slice stores
+template <typename Op, typename Obj, typename L, typename U, typename S, typename V>
+struct aug_exec<Op, ast::subscript_expr<Obj, ast::slice_expr<L, U, S>>, V> {
+	template <typename St> static constexpr Flow run(St & st) {
+		st.raise_error(ex_kind::TypeError, "ctpy v0.1: slice assignment is not supported");
+		return Flow::next;
+	}
+};
+
 template <typename Op, typename Target, typename V> struct executor<ast::aug_stmt<Op, Target, V>> {
 	template <typename St> static constexpr Flow run(St & st) {
 		return aug_exec<Op, Target, V>::run(st);

@@ -140,6 +140,28 @@ constexpr long long range_len(long long start, long long stop, long long step) n
 	return start > stop ? (start - stop - step - 1) / (-step) : 0;
 }
 
+// spell a small count for an error message ("expected 2, got 3")
+constexpr ctc::string<20> dec(long long value) noexcept {
+	ctc::string<20> out{};
+	unsigned long long magnitude = 0;
+	if (value < 0) {
+		out.push_back('-');
+		magnitude = 0ULL - static_cast<unsigned long long>(value);
+	} else {
+		magnitude = static_cast<unsigned long long>(value);
+	}
+	char digits[20]{};
+	std::size_t used = 0;
+	do {
+		digits[used++] = static_cast<char>('0' + static_cast<char>(magnitude % 10ULL));
+		magnitude /= 10ULL;
+	} while (magnitude != 0);
+	while (used > 0) {
+		out.push_back(digits[--used]);
+	}
+	return out;
+}
+
 } // namespace detail
 
 // --- Python exceptions (soft channel - NEVER C++ exceptions) -------------
@@ -158,6 +180,7 @@ CTPY_EXPORT enum class ex_kind : unsigned char {
 	OverflowError,
 	IndexError,
 	KeyError,
+	AttributeError,
 	RecursionError,
 	StopIteration,
 	OSError,
@@ -175,6 +198,7 @@ CTPY_EXPORT constexpr std::string_view ex_name(ex_kind kind) noexcept {
 		case ex_kind::OverflowError: return "OverflowError";
 		case ex_kind::IndexError: return "IndexError";
 		case ex_kind::KeyError: return "KeyError";
+		case ex_kind::AttributeError: return "AttributeError";
 		case ex_kind::RecursionError: return "RecursionError";
 		case ex_kind::StopIteration: return "StopIteration";
 		case ex_kind::OSError: return "OSError";
@@ -193,6 +217,7 @@ CTPY_EXPORT inline constexpr ex_kind ValueError = ex_kind::ValueError;
 CTPY_EXPORT inline constexpr ex_kind OverflowError = ex_kind::OverflowError;
 CTPY_EXPORT inline constexpr ex_kind IndexError = ex_kind::IndexError;
 CTPY_EXPORT inline constexpr ex_kind KeyError = ex_kind::KeyError;
+CTPY_EXPORT inline constexpr ex_kind AttributeError = ex_kind::AttributeError;
 CTPY_EXPORT inline constexpr ex_kind RecursionError = ex_kind::RecursionError;
 CTPY_EXPORT inline constexpr ex_kind StopIteration = ex_kind::StopIteration;
 CTPY_EXPORT inline constexpr ex_kind OSError = ex_kind::OSError;
