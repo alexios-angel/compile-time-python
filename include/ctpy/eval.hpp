@@ -1331,9 +1331,11 @@ template <typename Node, typename St> constexpr std::uint32_t eval_node(St & st)
 }
 
 // unwrap ctpy::eval<Src>'s module: it must hold exactly one expression
+// (the eval<Src> sugar itself lives in result.hpp, over the same
+// right-sizing machinery as run<Src>)
 template <typename M> struct single_expr {
 	static_assert(sizeof(M) == 0,
-		"ctpy::eval<Src> evaluates a single EXPRESSION; statements need ctpy::run<Src> (M8)");
+		"ctpy::eval<Src> evaluates a single EXPRESSION; statements need ctpy::run<Src>");
 };
 template <typename E> struct single_expr<ast::module<ast::expr_stmt<E>>> {
 	using type = E;
@@ -1345,86 +1347,6 @@ template <typename E> struct single_expr<ast::module<ast::expr_stmt<E>>> {
 // object-pool index of the result (None if an exception is in flight)
 CTPY_EXPORT template <typename Node, typename St> constexpr std::uint32_t eval(St & st) {
 	return detail::eval_node<Node, St>(st);
-}
-
-// The result of ctpy::eval<Src>: one scalar-ish Python value copied
-// out of the (dead) arena, or the Python exception that ended the
-// evaluation. INTERIM shape - M8's run<>/value views replace the
-// payload side wholesale; only ok()/exception()/to<T>()/str() are
-// meant to be leaned on.
-CTPY_EXPORT struct eval_result {
-	static constexpr std::size_t str_capacity = 256;
-
-	Kind kind = Kind::none;
-	long long int_value = 0;
-	double float_value = 0.0;
-	ctc::string<str_capacity> str_value{};
-	bool raised = false;
-	PyError error{};
-
-	constexpr bool ok() const noexcept {
-		return !raised;
-	}
-	constexpr const PyError & exception() const noexcept {
-		return error;
-	}
-	constexpr std::string_view str() const noexcept {
-		return str_value.view();
-	}
-	template <typename T> constexpr T to() const noexcept {
-		if constexpr (std::is_same_v<T, bool>) {
-			switch (kind) {
-				case Kind::boolean:
-				case Kind::int_: return int_value != 0;
-				case Kind::float_: return float_value != 0.0;
-				case Kind::str: return !str_value.empty();
-				default: return false;
-			}
-		} else if constexpr (std::is_floating_point_v<T>) {
-			return kind == Kind::float_ ? static_cast<T>(float_value) : static_cast<T>(int_value);
-		} else {
-			static_assert(std::is_integral_v<T>, "eval_result::to<T>: T must be arithmetic in M3");
-			return kind == Kind::float_ ? static_cast<T>(float_value) : static_cast<T>(int_value);
-		}
-	}
-};
-
-// sugar: evaluate one Python expression at compile time.
-//   static_assert(ctpy::eval<"2 ** 10">().to<int>() == 1024);
-// Family policy: a NON-PARSING source hard-errors here (static_assert
-// names the stage); a RAISING expression is a soft ok()==false result.
-CTPY_EXPORT template <ctll::fixed_string Src, typename ArenaT = Arena<>>
-constexpr eval_result eval() noexcept {
-	static_assert(is_valid<Src>, "ctpy::eval<Src>: the source failed to pre-lex or parse");
-	using Expr = typename detail::single_expr<detail::parsed_module<Src>>::type;
-	State<ArenaT> st{};
-	const std::uint32_t value = detail::eval_node<Expr>(st);
-	eval_result out{};
-	out.raised = st.raised;
-	out.error = st.error;
-	if (!st.raised) {
-		const Object & object = st.a.objs[value];
-		out.kind = object.kind;
-		switch (object.kind) {
-			case Kind::boolean:
-			case Kind::int_:
-				out.int_value = object.i;
-				break;
-			case Kind::float_:
-				out.float_value = object.f;
-				break;
-			case Kind::str: {
-				const std::string_view content = st.str_of(object);
-				out.str_value.append(content.size() <= eval_result::str_capacity
-					? content
-					: content.substr(0, eval_result::str_capacity));
-				break;
-			}
-			default:
-				break; // container payloads land with the M8 value views
-		}
-	}
-	return out;
 }
 
 } // namespace ctpy

@@ -19,8 +19,12 @@
 // stdout, globals (as uniform null-object ctpy::value views), and any
 // Python exception are all compile-time values.
 //
-// Under construction: see README.md for the v0.1 subset and the
-// C++ <-> Python boundary design (arg<>, lift<>, file<>, pymodule<>).
+// The boundary (see README.md): ctpy::arg<"name">(v) seeds globals,
+// ctpy::lift<CtcContainer>(out["xs"]) lifts values back out,
+// ctpy::file<"path", "contents"> mounts the compile-time VFS behind
+// open(), ctpy::stdin_text<"..."> feeds input(), ctpy::eval<"expr">()
+// evaluates one expression, and ctpy::module<src>.call<"fn">(args...)
+// invokes a def.
 
 #include "ctpy/version.hpp"
 #include "ctpy/prelex.hpp"
@@ -35,5 +39,8 @@
 #include "ctpy/builtins.hpp"
 #include "ctpy/fstring.hpp"
 #include "ctpy/exec.hpp"
+#include "ctpy/views.hpp"
+#include "ctpy/result.hpp"
+#include "ctpy/bind.hpp"
 
 #endif

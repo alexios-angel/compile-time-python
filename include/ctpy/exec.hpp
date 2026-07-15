@@ -43,9 +43,10 @@
 //     defs see globals + their own locals only (NO closures in v0.1);
 //     recursion is guarded by the soft RecursionError at depth 100.
 //
-// ctpy::run<Src>() executes a whole module and snapshots the globals
-// into an INTERIM result: ok()/exception() plus ["name"].to<T>() for
-// scalars and str. The full right-sized value views land in M8.
+// The public entry points over this walk - ctpy::run<Src>(args...),
+// ctpy::eval<Src>(), ctpy::module<Src>.call<Fn>(...) - live in
+// result.hpp, which right-sizes the dead arena into per-Src static
+// storage and hands out the uniform ctpy::value views (views.hpp).
 
 namespace ctpy {
 
@@ -583,132 +584,6 @@ template <typename... Stmts> struct executor<ast::module<Stmts...>> {
 // interpreter state, returning how control left it
 CTPY_EXPORT template <typename Stmt, typename St> constexpr Flow exec(St & st) {
 	return detail::exec_node<Stmt, St>(st);
-}
-
-// --- ctpy::run<Src>: execute a module, snapshot the globals -------------------
-
-// one global's value as copied out of the (dead) arena. INTERIM shape:
-// scalars and str only - M8's right-sized ctpy::value views replace
-// this wholesale (container payloads read as their Kind with an empty
-// payload until then).
-CTPY_EXPORT struct run_value {
-	static constexpr std::size_t str_capacity = 64;
-
-	Kind kind = Kind::none;
-	bool bound = false; // false = the name was never assigned
-	long long int_value = 0;
-	double float_value = 0.0;
-	ctc::string<str_capacity> str_value{};
-
-	constexpr bool exists() const noexcept {
-		return bound;
-	}
-	constexpr std::string_view str() const noexcept {
-		return str_value.view();
-	}
-	template <typename T> constexpr T to() const noexcept {
-		if constexpr (std::is_same_v<T, bool>) {
-			switch (kind) {
-				case Kind::boolean:
-				case Kind::int_: return int_value != 0;
-				case Kind::float_: return float_value != 0.0;
-				case Kind::str: return !str_value.empty();
-				default: return false;
-			}
-		} else if constexpr (std::is_floating_point_v<T>) {
-			return kind == Kind::float_ ? static_cast<T>(float_value) : static_cast<T>(int_value);
-		} else {
-			static_assert(std::is_integral_v<T>, "run_value::to<T>: T must be arithmetic in M4");
-			return kind == Kind::float_ ? static_cast<T>(float_value) : static_cast<T>(int_value);
-		}
-	}
-};
-
-// one snapshotted global (the name view points into ast text<> static
-// storage, which outlives every result)
-CTPY_EXPORT struct global_entry {
-	std::string_view name{};
-	run_value value{};
-};
-
-// the result of running a module: ok()/exception(), captured stdout
-// (everything print() wrote), plus the globals by name. INTERIM - M8
-// right-sizes into per-Src static storage with uniform chaining views.
-CTPY_EXPORT struct run_result {
-	static constexpr std::size_t globals_capacity = 64;
-	static constexpr std::size_t stdout_capacity = 2048;
-
-	ctc::vector<global_entry, globals_capacity> globals{};
-	ctc::string<stdout_capacity> stdout_text{};
-	bool raised = false;
-	PyError error{};
-
-	constexpr bool ok() const noexcept {
-		return !raised;
-	}
-	constexpr const PyError & exception() const noexcept {
-		return error;
-	}
-	constexpr std::string_view stdout() const noexcept {
-		return stdout_text.view();
-	}
-	constexpr run_value operator[](std::string_view name) const noexcept {
-		for (std::size_t at = 0; at < globals.size(); ++at) {
-			if (globals[at].name == name) {
-				return globals[at].value;
-			}
-		}
-		return run_value{}; // unbound: kind none, exists() false
-	}
-};
-
-// run a Python module at compile time.
-//   constexpr auto out = ctpy::run<"total = 0\nfor i in range(5):\n    total += i\n">();
-//   static_assert(out.ok() && out["total"].to<int>() == 10);
-// Family policy: a NON-PARSING source hard-errors here (static_assert
-// names the stage); a RAISING script is a soft ok()==false result.
-CTPY_EXPORT template <ctll::fixed_string Src, typename ArenaT = Arena<>>
-constexpr run_result run() noexcept {
-	static_assert(is_valid<Src>, "ctpy::run<Src>: the source failed to pre-lex or parse");
-	using Module = detail::parsed_module<Src>;
-	State<ArenaT> st{};
-	(void)detail::exec_node<Module, State<ArenaT>>(st);
-	run_result out{};
-	out.raised = st.raised;
-	out.error = st.error;
-	for (std::size_t at = 0; at < st.a.out.size() && at < run_result::stdout_capacity; ++at) {
-		out.stdout_text.push_back(st.a.out[at]); // interim cap; M8 right-sizes per Src
-	}
-	for (std::uint32_t at = 0; at < st.globals_count; ++at) {
-		if (out.globals.size() == run_result::globals_capacity) {
-			break; // interim cap; M8 right-sizes per Src
-		}
-		const Binding & binding = st.a.frames[at];
-		const Object & object = st.a.objs[binding.obj];
-		run_value value{};
-		value.bound = true;
-		value.kind = object.kind;
-		switch (object.kind) {
-			case Kind::boolean:
-			case Kind::int_:
-				value.int_value = object.i;
-				break;
-			case Kind::float_:
-				value.float_value = object.f;
-				break;
-			case Kind::str: {
-				const std::string_view content = st.str_of(object);
-				value.str_value.append(content.size() <= run_value::str_capacity
-					? content
-					: content.substr(0, run_value::str_capacity));
-				break;
-			}
-			default:
-				break; // container payloads land with the M8 value views
-		}
-		out.globals.push_back(global_entry{binding.name, value});
-	}
-	return out;
 }
 
 } // namespace ctpy

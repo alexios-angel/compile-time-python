@@ -30,14 +30,30 @@ static_assert(out["answer"].to<int>() == 55);    // globals are readable
 
 **Python → C++.** `run<src>()` returns a result: `ok()`, `exception()`
 (a *raising* script does not fail your build — the traceback is a value),
-`stdout()`, and `operator[]` over the script's globals. Globals come back as
-`ctpy::value` — a uniform, null-object-chaining view (`out["a"]["b"][0]`,
-misses are harmless), with `to<T>()` scalar conversion and
-`ctpy::lift<ctc::vector<int, 16>>(out["xs"])` for lifting whole structures
-into ctc containers (then right-size with `ctc::shrunk` as usual).
+`stdout()`, `operator[]` over the script's globals, and `.globals()`
+iteration. Globals come back as `ctpy::value` — a uniform,
+null-object-chaining view with `to<T>()` / `str()` conversion and
+`begin()`/`end()` element iteration:
+
+```cpp
+constexpr auto cfg = ctpy::run<"cfg = {'name': 'ctpy', 'dims': [3, 4]}\n">();
+static_assert(cfg["cfg"]["name"].str() == "ctpy"); // views chain to any depth
+static_assert(cfg["cfg"]["dims"][1].to<int>() == 4);
+static_assert(!cfg["cfg"]["nope"][0].exists());    // misses chain harmlessly
+```
+
+Whole structures lift into ctc containers (right-size with `ctc::shrunk`
+as usual):
+
+```cpp
+constexpr auto sorted_out = ctpy::run<"xs = sorted([3, 1, 4, 1, 5])\n">();
+constexpr auto xs = ctpy::lift<ctc::vector<int, 16>>(sorted_out["xs"]);
+static_assert(xs.size() == 5 && xs[0] == 1 && xs[4] == 5);
+```
 
 **C++ → Python.** Named arguments seed the script's globals — scalars,
-string literals, and ctc containers all lift in:
+string literals, and ctc containers (`vector`/`map`/`string`, nested) all
+lift in:
 
 ```cpp
 constexpr auto r = ctpy::run<"total = sum(values) * factor\n">(
@@ -46,51 +62,75 @@ constexpr auto r = ctpy::run<"total = sum(values) * factor\n">(
 static_assert(r["total"].to<int>() == 60);
 ```
 
-**Sugar.** `ctpy::eval<"2 ** 10">().to<int>()` for one expression;
-`ctpy::module<src>` parses once and `.call<"fib">(20)` invokes a `def`.
+**Sugar.** `ctpy::eval<"2 ** 10">().to<int>()` evaluates one expression;
+`ctpy::module<src>` parses once and `.call<"fn">(args...)` invokes a `def`
+(arguments lift like `arg<>` payloads, the return value rides the result):
+
+```cpp
+constexpr auto fib = ctpy::module<R"py(
+def fib(n):
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, a + b
+    return a
+)py">;
+static_assert(fib.call<"fib">(20).to<int>() == 6765);
+```
 
 **Failure policy** (family convention): a script that fails to *parse*
 hard-errors the build with a static_assert naming the stage;
-`ctpy::is_valid<src>` and `ctpy::error_message<src>()` (caret diagnostics)
-never hard-error. A script that *raises* is a value: `out.ok()` is false.
+`ctpy::is_valid<src>` never hard-errors (caret diagnostics via
+`ctpy::error_message<src>()` land with the diagnostics milestone). A script
+that *raises* is a value: `out.ok()` is false and `out.exception()` compares
+against `ctpy::ZeroDivisionError`, `ctpy::TypeError`, ... with the exact
+CPython message queryable.
 
 **IO today, `std::embed` tomorrow.** There is no filesystem at compile time
 (yet), so `open()` raises `OSError` — unless you mount one:
 
 ```cpp
-constexpr auto r = ctpy::run<R"py(
+constexpr auto io = ctpy::run<R"py(
 data = open("config.txt").read()
 )py">(ctpy::file<"config.txt", "timeout=250\n">);
+static_assert(io["data"].str() == "timeout=250\n");
 ```
 
 When `std::embed` lands, `ctpy::file<"path">` gains a real-file overload and
-nothing else changes. `input()` reads from `ctpy::stdin_text<"...">`.
+nothing else changes. `input()` reads the mounted `ctpy::stdin_text<"...">`
+line by line:
+
+```cpp
+constexpr auto fed = ctpy::run<"who = input()\n">(ctpy::stdin_text<"world\n">);
+static_assert(fed["who"].str() == "world");
+```
 
 **The stdlib seam.** `import` resolves against a compile-time module
-registry; `ctpy::pymodule<"helpers", src>` mounts user modules. Python's
-pure-Python standard library lands here incrementally in future versions.
+registry; `ctpy::pymodule<"helpers", src>` mounts user modules (v0.1 fixes
+the descriptor shape and validates the source parses — `import` execution is
+deferred). Python's pure-Python standard library lands here incrementally in
+future versions.
 
 ## Status
 
-Under construction (v0.1 in progress). The v0.1 language subset: int, float,
-bool, None, str, list, tuple, dict, set; assignment (incl. tuple unpacking,
-augmented, chained); the full operator ladder (ternary, or/and/not, chained
+The v0.1 interpreter is complete and running: int, float, bool, None, str,
+list, tuple, dict, set; assignment (incl. tuple unpacking, augmented,
+chained); the full operator ladder (ternary, or/and/not, chained
 comparisons, in/is, bitwise, shifts, arithmetic, unary, `**`); calls,
-indexing, slicing, attributes; if/elif/else, while/for (+break/continue/
-else); def with default args and recursion (RecursionError guard); print,
-len, range, sum, min, max, abs, str, int, bool, sorted, enumerate, zip;
-f-strings (`{expr}`, no format specs). Deferred: classes, generators,
-comprehensions, try/except, import execution, with, decorators, async.
+indexing, slicing, method attributes; if/elif/else, while/for
+(+break/continue/else); def with default args and recursion (RecursionError
+guard at depth 100, no closures); print (sep/end), len, range, sum, min,
+max, abs, str, int, bool, sorted, enumerate, zip, open, input; f-strings
+(`{expr}`, no format specs); and the whole C++ boundary above — results
+right-sized into per-script static storage, `ctpy::value` views, `arg<>`
+in, `lift<>` out, the `file<>`/`stdin_text<>` IO seam.
 
-Done so far: the pre-lexer (indentation -> markers, `ctpy::prelex_ok`) and
-the parser — `python.lark` compiles conflict-free through Tablewright to a
-character-level (q)LL(1) CTLL table, and the semantic actions build the
-type-level AST with precedence folded on the type stack. `ctpy::is_valid<src>`
-is live (a plain bool, never a compile error). Number literals are decimal
-ints and basic floats for now (no exponents/hex), string prefixes are limited
-to `f`, and implicit string concatenation, semicolons, tuple subscripts
-(`a[1, 2]`) and comprehensions are out of the v0.1 grammar — see PLAN.md
-progress notes for the full list. The interpreter (`ctpy::run`) is next.
+Deferred beyond v0.1: classes, generators, comprehensions, try/except,
+import execution, with, decorators, async. Documented deviations (ints are
+64-bit — overflow raises where CPython grows a bignum; floats print with 16
+significant digits; enumerate/zip materialize; calls are positional-only
+except print) live in PLAN.md's progress notes. Still to come for v0.1:
+caret diagnostics (`error_message<src>()`, exception line numbers) and the
+release scaffolding (CI, examples, single-header).
 
 ## Build & test
 
@@ -113,9 +153,10 @@ the CMake interface carry the flags (opt out with `-DCTPY_CONSTEXPR_LIMITS=OFF`)
 protected, comments stripped) → CTLL (q)LL(1) parse over the marker stream
 (table generated by Tablewright from python.lark) → type-level AST →
 constexpr tree-walk interpreter (value-level arena heap of ctc containers)
-→ right-sized results in static storage`. `include/ctll/` and `include/ctc/`
-are vendored; `include/ctpy/python.hpp` is generated — edit `python.lark`
-and `make regrammar`.
+→ flatten the reachable result → right-size via ctc::shrunk into per-script
+static storage → uniform ctpy::value views`. `include/ctll/` and
+`include/ctc/` are vendored; `include/ctpy/python.hpp` is generated — edit
+`python.lark` and `make regrammar`.
 
 ## License
 

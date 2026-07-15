@@ -19,8 +19,9 @@
 // builtin set is complete here: print (sep/end keywords), len, range
 // (lazy object - three pool ints, iterated arithmetically), sum, min,
 // max (iterable and 2+-scalar forms), abs, str, int, bool, sorted
-// (stable), enumerate, zip - plus the Python str()/repr() formatting
-// every one of them and the f-string evaluator (fstring.hpp) share.
+// (stable), enumerate, zip, open (the compile-time VFS seam), input
+// (the mounted stdin) - plus the Python str()/repr() formatting every
+// one of them and the f-string evaluator (fstring.hpp) share.
 //
 // Calling a NAME dispatches here: a bound name wins (Python lets you
 // shadow builtins), an unbound one is looked up in the builtin table,
@@ -346,6 +347,9 @@ constexpr void write_object(St & st, Sink & sink, std::uint32_t index, bool repr
 		}
 		case Kind::function:
 			sink_text(sink, "<function>"); // CPython adds a name and an address
+			return;
+		case Kind::file:
+			sink_text(sink, "<TextIOWrapper>"); // CPython adds name/mode/encoding
 			return;
 	}
 }
@@ -831,13 +835,74 @@ constexpr std::uint32_t builtin_zip(St & st, const std::uint32_t * argv, std::si
 	                      .count = static_cast<std::uint32_t>(total)});
 }
 
+// --- open(): the compile-time VFS (the std::embed-ready IO seam) --------------
+
+// There is no filesystem at compile time, so open() resolves against
+// the descriptors run() was given: ctpy::file<"path", "contents">
+// (bind.hpp) seeds State::vfs before the module executes. A mounted
+// path opens as a file object whose contents share the char pool; an
+// unmounted one raises OSError the way CPython's FileNotFoundError
+// (an OSError subclass) spells it. v0.1 is read-only and text-mode:
+// only the one-argument form exists.
+template <typename St>
+constexpr std::uint32_t builtin_open(St & st, const std::uint32_t * argv, std::size_t argc) {
+	if (argc != 1) {
+		return st.raise_error(ex_kind::TypeError,
+			"ctpy v0.1: open() takes exactly one argument (the compile-time VFS is read-only text)");
+	}
+	const Object path = st.a.objs[argv[0]]; // copy: make_str below grows the pool
+	if (path.kind != Kind::str) {
+		return st.raise_error(ex_kind::TypeError,
+			{"expected str, bytes or os.PathLike object, not ", type_name(path.kind)});
+	}
+	for (std::size_t at = 0; at < st.vfs.size(); ++at) {
+		if (st.vfs[at].path == st.str_of(path)) {
+			// the file object holds its contents as a char-pool run;
+			// read() hands the same run out as a str (no copy)
+			const std::uint32_t out = st.make_str(st.vfs[at].contents);
+			st.a.objs[out].kind = Kind::file;
+			return out;
+		}
+	}
+	st.raise_error(ex_kind::OSError, {});
+	st.error.append("[Errno 2] No such file or directory: ");
+	append_repr(st, argv[0]);
+	return st.none();
+}
+
+// --- input(): reads the mounted ctpy::stdin_text<> line by line ----------------
+
+template <typename St>
+constexpr std::uint32_t builtin_input(St & st, const std::uint32_t * argv, std::size_t argc) {
+	if (argc > 1) {
+		const auto got = dec(static_cast<long long>(argc));
+		return st.raise_error(ex_kind::TypeError,
+			{"input expected at most 1 argument, got ", got.view()});
+	}
+	if (argc == 1) { // the prompt prints to captured stdout, no newline
+		stdout_sink<St> sink{st};
+		write_object(st, sink, argv[0], false);
+	}
+	if (st.stdin_at >= st.stdin_content.size()) {
+		return st.raise_error(ex_kind::EOFError, "EOF when reading a line");
+	}
+	const std::size_t from = st.stdin_at;
+	std::size_t to = from;
+	while (to < st.stdin_content.size() && st.stdin_content[to] != '\n') {
+		++to;
+	}
+	// the newline is consumed but not part of the line, per CPython
+	st.stdin_at = to < st.stdin_content.size() ? to + 1 : to;
+	return st.make_str(st.stdin_content.substr(from, to - from));
+}
+
 // --- the builtin table ---------------------------------------------------------
 
 constexpr bool is_builtin(std::string_view name) noexcept {
 	return name == "print" || name == "range" || name == "len" || name == "sum" ||
 	       name == "min" || name == "max" || name == "abs" || name == "str" ||
 	       name == "int" || name == "bool" || name == "sorted" || name == "enumerate" ||
-	       name == "zip";
+	       name == "zip" || name == "open" || name == "input";
 }
 
 template <typename St>
@@ -888,6 +953,12 @@ constexpr std::uint32_t call_builtin(St & st, std::string_view name,
 	if (name == "zip") {
 		return builtin_zip(st, argv, argc);
 	}
+	if (name == "open") {
+		return builtin_open(st, argv, argc);
+	}
+	if (name == "input") {
+		return builtin_input(st, argv, argc);
+	}
 	return st.raise_error(ex_kind::NameError, {"name '", name, "' is not defined"});
 }
 
@@ -925,6 +996,18 @@ template <typename St>
 constexpr std::uint32_t call_method(St & st, std::uint32_t self, std::string_view name,
                                     const std::uint32_t * argv, std::size_t argc) {
 	const Object object = st.a.objs[self]; // copy: methods below may grow the pool
+	if (object.kind == Kind::file && name == "read") {
+		if (argc != 0) {
+			return st.raise_error(ex_kind::TypeError,
+				"ctpy v0.1: read() takes no arguments (the whole file is read at once)");
+		}
+		if (st.a.objs[self].i != 0) { // already consumed: CPython returns ''
+			return st.make_str("");
+		}
+		st.a.objs[self].i = 1;
+		// share the file's char run - str objects are immutable
+		return st.push(Object{.kind = Kind::str, .first = object.first, .count = object.count});
+	}
 	if (object.kind == Kind::list && name == "append") {
 		if (argc != 1) {
 			const auto got = dec(static_cast<long long>(argc));

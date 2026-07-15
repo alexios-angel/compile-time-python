@@ -396,6 +396,74 @@ manual `cp -R` + `diff -rq` in CLAUDE.md.
   - Builtins are still not first-class values (x = len is a NameError,
     documented in builtins.hpp).
 
+- **M8 results/binding: DONE.** result.hpp (flatten + right-size +
+  run/eval), views.hpp (ctpy::value), bind.hpp (arg/file/stdin_text/
+  pymodule/lift/module); the interim M3/M4 result plumbing is gone;
+  tests/results_binding.cpp mirrors every README snippet verbatim
+  before the deeper coverage. Design notes vs. section 6:
+  - *One result shape for everything*: run<Src>(seeds...),
+    eval<Src>() and module<Src>.call<Fn>(args...) all return
+    run_result<result_caps> - dense flattened pools (objs/chars/pairs
+    as plain public ctc data), the bindings, right-sized stdout, the
+    PyError channel, plus a result_obj slot that carries eval's
+    expression value / call's return value (`result()`, with
+    to<T>()/str()/.kind forwarded on the result itself, which is what
+    keeps the M3-era `eval<...>().kind == Kind::range` asserts
+    compiling untouched).
+  - *The flattening pass* is a memoized garbage-collecting deep copy
+    out of the dead State: runs are memoized by origin (first, count)
+    so shared runs stay shared (and flat size stays <= arena size);
+    container runs are RESERVED first (resize) then filled so they
+    stay contiguous while element payloads land behind them; v0.1
+    data cannot be cyclic (displays/append copy element objects), so
+    recursion terminates at the data's nesting depth.
+  - *Per-Src static constexpr results, exactly as planned, but only
+    for SEED-FREE runs*: oversized_run<Src> (a variable template -
+    the interpreter executes once per Src however many asserts read
+    it) is right-sized pool-by-pool through ctc::shrunk into
+    stored_run<Src>. A seeded run's sizes depend on the seed VALUES,
+    which no function argument can lift to type level in C++20, so
+    run<src>(args...) keeps the oversized capacities (documented in
+    result.hpp; the user right-sizes lifted pieces via lift<> +
+    shrunk). flat_global keeps const char* + length rather than a
+    std::string_view because libstdc++'s string_view has private
+    members (not structural) and would sink the shrunk NTTP.
+  - *ctpy::value* is an eager view: scalars are copied in, str views
+    its chars, containers carry pool pointers + their run, so a view
+    is self-contained and operator[] derives child views on the fly
+    (no per-type static arrays like ctjson needs - results here are
+    values, not types). Python semantics in the views: dict
+    subscripts are KEY lookups (str via [sv], int via [ll] - never
+    positional), negative indices count from the end, sets do not
+    subscript, str/range index/iterate by synthesizing 1-char str /
+    int views, dicts iterate their keys; begin()/end() is a
+    materializing iterator (elements have no common storage to point
+    at). Misses are present==false null objects that chain forever.
+  - *bind.hpp*: arg<> payloads are scalars, string literals /
+    string_view (stored as a view of the caller's static storage),
+    and ctc::vector/map/string nested arbitrarily (make_object
+    overload recursion; a map's Compare order becomes dict insertion
+    order). lift<> inverts it (vector from any iterable incl. lazy
+    ranges, dict lifts keys like list(d); misses/mismatches lift
+    EMPTY, family null-object policy). file<> mounts State::vfs;
+    open() gained Kind::file + ex_kind has EOFError now; open is
+    1-arg (int path = TypeError spelled like CPython's, documented
+    deviation: real CPython would treat it as an fd), unmounted =
+    OSError "[Errno 2] No such file or directory: 'path'", read()
+    consumes (second read is ''). input() reads stdin_text<> lines
+    (prompt -> stdout, EOFError "EOF when reading a line" when dry;
+    an unterminated final line still reads). pymodule<> is the fixed
+    v0.1 shape: validates its source parses, seeds nothing (import
+    execution deferred). ctpy::module<Src> is a variable template
+    (module_t instance) - `module` as an identifier is safe here,
+    the contextual-keyword rules only bite line-initial directives -
+    and .call<Fn> executes the body then dispatches the def's thunk,
+    lifting arguments like arg<> payloads. All parity messages
+    (open/input/EOFError/arity) re-verified against CPython 3.14.
+  - run/eval/call are noexcept constexpr; a pool overflow inside is
+    the ctc precondition trap (build error naming the violation),
+    never an exception.
+
 ## Risks
 
 Constexpr budget blowups (mitigations: LL(1) not Earley, loops not recursion

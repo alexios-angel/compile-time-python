@@ -43,6 +43,7 @@ CTPY_EXPORT enum class Kind : unsigned char {
 	set,
 	dict,
 	function,
+	file, // an open()ed compile-time VFS file (bind.hpp mounts them)
 };
 
 // Python's name for a Kind, as spelled by type(x).__name__ (used in
@@ -60,6 +61,7 @@ CTPY_EXPORT constexpr std::string_view type_name(Kind kind) noexcept {
 		case Kind::set: return "set";
 		case Kind::dict: return "dict";
 		case Kind::function: return "function";
+		case Kind::file: return "TextIOWrapper"; // CPython: type(open(...)).__name__
 	}
 	return "object";
 }
@@ -75,6 +77,8 @@ CTPY_EXPORT constexpr std::string_view type_name(Kind kind) noexcept {
 //   dict          [first, first+count) of Arena::pairs
 //   function      i = State::thunks index; [first, first+count) of
 //                 Arena::objs are the def-time-evaluated defaults
+//   file          [first, first+count) of Arena::chars is the mounted
+//                 contents; i != 0 once read() has consumed it
 CTPY_EXPORT struct Object {
 	Kind kind = Kind::none;
 	long long i = 0;
@@ -184,6 +188,7 @@ CTPY_EXPORT enum class ex_kind : unsigned char {
 	RecursionError,
 	StopIteration,
 	OSError,
+	EOFError,
 	TabError,
 	SyntaxError,
 };
@@ -202,6 +207,7 @@ CTPY_EXPORT constexpr std::string_view ex_name(ex_kind kind) noexcept {
 		case ex_kind::RecursionError: return "RecursionError";
 		case ex_kind::StopIteration: return "StopIteration";
 		case ex_kind::OSError: return "OSError";
+		case ex_kind::EOFError: return "EOFError";
 		case ex_kind::TabError: return "TabError";
 		case ex_kind::SyntaxError: return "SyntaxError";
 	}
@@ -221,6 +227,7 @@ CTPY_EXPORT inline constexpr ex_kind AttributeError = ex_kind::AttributeError;
 CTPY_EXPORT inline constexpr ex_kind RecursionError = ex_kind::RecursionError;
 CTPY_EXPORT inline constexpr ex_kind StopIteration = ex_kind::StopIteration;
 CTPY_EXPORT inline constexpr ex_kind OSError = ex_kind::OSError;
+CTPY_EXPORT inline constexpr ex_kind EOFError = ex_kind::EOFError;
 CTPY_EXPORT inline constexpr ex_kind TabError = ex_kind::TabError;
 CTPY_EXPORT inline constexpr ex_kind SyntaxError = ex_kind::SyntaxError;
 
@@ -250,6 +257,18 @@ CTPY_EXPORT struct PyError {
 	friend constexpr bool operator==(const PyError & error, ex_kind kind) noexcept {
 		return error.type == kind;
 	}
+};
+
+// --- the IO seam (bind.hpp mounts, builtins.hpp consumes) -------------------
+
+// one mounted compile-time VFS file. Both views point into the static
+// storage of a ctpy::file<Path, Contents> descriptor (narrowed
+// fixed_string NTTPs), which outlives any State. open() searches these;
+// an unmounted path raises OSError. When std::embed lands, mounting a
+// real file only changes how the descriptor fills `contents`.
+CTPY_EXPORT struct vfs_entry {
+	std::string_view path{};
+	std::string_view contents{};
 };
 
 // --- the interpreter state ------------------------------------------------
@@ -282,6 +301,9 @@ CTPY_EXPORT template <typename ArenaT = Arena<>> struct State {
 	PyError error{};
 	int depth = 0;                          // live Python calls (the soft recursion guard)
 	int recursion_limit = 100;              // RecursionError fires here, far below -fconstexpr-depth
+	ctc::vector<vfs_entry, 16> vfs{};       // mounted ctpy::file<> descriptors, seeded before exec
+	std::string_view stdin_content{};       // mounted ctpy::stdin_text<>; input() reads lines
+	std::size_t stdin_at = 0;               // input()'s cursor into stdin_content
 
 	constexpr State() {
 		a.objs.push_back(Object{});                                    // None
@@ -352,7 +374,8 @@ CTPY_EXPORT template <typename ArenaT = Arena<>> struct State {
 				return detail::range_len(a.objs[object.first].i,
 				                         a.objs[object.first + 1].i,
 				                         a.objs[object.first + 2].i) != 0;
-			case Kind::function: return true;
+			case Kind::function:
+			case Kind::file: return true;
 		}
 		return true;
 	}
