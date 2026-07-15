@@ -20,9 +20,10 @@ static_assert(run<"print(True, False, None)\n">().stdout() == "True False None\n
 static_assert(run<"print(-7)\n">().stdout() == "-7\n");
 
 // the umbrella-header example, end to end
-static_assert(run<
-"answer = 6 * 7\n"
-"print(\"the answer is\", answer)\n">().stdout() == "the answer is 42\n");
+static_assert(run<R"py(
+answer = 6 * 7
+print("the answer is", answer)
+)py">().stdout() == "the answer is 42\n");
 
 // sep and end keywords (print is the one v0.1 builtin taking keywords)
 static_assert(run<"print('a', 'b', sep='')\n">().stdout() == "ab\n");
@@ -30,7 +31,10 @@ static_assert(run<"print(1, 2, sep=', ', end='!\\n')\n">().stdout() == "1, 2!\n"
 static_assert(run<"print(1.5, True, None, sep='|')\n">().stdout() == "1.5|True|None\n");
 static_assert(run<"print(1, end='')\n">().stdout() == "1");
 static_assert(run<"print(1, sep=None, end=None)\n">().stdout() == "1\n"); // None = default
-static_assert(run<"print(1)\nprint(2)\n">().stdout() == "1\n2\n");
+static_assert(run<R"py(
+print(1)
+print(2)
+)py">().stdout() == "1\n2\n");
 static_assert(run<"print(1, sep=5)\n">().exception() == ctpy::TypeError);
 static_assert(run<"print(1, sep=5)\n">().exception().message()
 	== "sep must be None or a string, not int");
@@ -41,11 +45,20 @@ static_assert(run<"print(1, file=2)\n">().exception().message()
 	== "print() got an unexpected keyword argument 'file'");
 
 // print writes NOTHING once an exception is in flight mid-statement
-static_assert(run<"print(1)\nprint(1 // 0)\n">().stdout() == "1\n");
-static_assert(run<"print(1)\nprint(1 // 0)\n">().exception() == ctpy::ZeroDivisionError);
+static_assert(run<R"py(
+print(1)
+print(1 // 0)
+)py">().stdout() == "1\n");
+static_assert(run<R"py(
+print(1)
+print(1 // 0)
+)py">().exception() == ctpy::ZeroDivisionError);
 
 // a bound name shadows the builtin
-static_assert(run<"print = 5\nprint(1)\n">().exception() == ctpy::TypeError);
+static_assert(run<R"py(
+print = 5
+print(1)
+)py">().exception() == ctpy::TypeError);
 
 // --- str() of every kind, and print's container reprs ---------------------------
 
@@ -206,8 +219,11 @@ static_assert(run<"print(sorted([]))\n">().stdout() == "[]\n");
 // stability: equal keys keep source order (True == 1, and 1 arrived first)
 static_assert(run<"print(sorted([2, 1, True]))\n">().stdout() == "[1, True, 2]\n");
 // sorting does NOT mutate the input
-static_assert(run<"xs = [3, 1]\nys = sorted(xs)\nprint(xs, ys)\n">().stdout()
-	== "[3, 1] [1, 3]\n");
+static_assert(run<R"py(
+xs = [3, 1]
+ys = sorted(xs)
+print(xs, ys)
+)py">().stdout() == "[3, 1] [1, 3]\n");
 static_assert(run<"print(sorted([1, 'a']))\n">().exception() == ctpy::TypeError);
 static_assert(run<"print(sorted([1, 'a']))\n">().exception().message()
 	== "'<' not supported between instances of 'str' and 'int'");
@@ -220,9 +236,10 @@ static_assert(run<"print(enumerate('ab'))\n">().stdout() == "[(0, 'a'), (1, 'b')
 static_assert(run<"print(enumerate('ab', 1))\n">().stdout() == "[(1, 'a'), (2, 'b')]\n");
 static_assert(run<"print(enumerate([], 5))\n">().stdout() == "[]\n");
 static_assert(run<"print(len(enumerate('abc')))\n">().stdout() == "3\n");
-static_assert(run<
-"for i, c in enumerate('abc'):\n"
-"    print(i, c)\n">().stdout() == "0 a\n1 b\n2 c\n");
+static_assert(run<R"py(
+for i, c in enumerate('abc'):
+    print(i, c)
+)py">().stdout() == "0 a\n1 b\n2 c\n");
 static_assert(run<"enumerate(5)\n">().exception().message() == "'int' object is not iterable");
 static_assert(run<"enumerate('ab', 'x')\n">().exception().message()
 	== "'str' object cannot be interpreted as an integer");
@@ -236,11 +253,12 @@ static_assert(run<"print(zip('ab'))\n">().stdout() == "[('a',), ('b',)]\n");
 static_assert(run<"print(zip())\n">().stdout() == "[]\n");
 static_assert(run<"print(zip('abc', range(10), [True]))\n">().stdout()
 	== "[('a', 0, True)]\n");
-static_assert(run<
-"total = 0\n"
-"for a, b in zip((1, 2), (3, 4)):\n"
-"    total += a * b\n"
-"print(total)\n">().stdout() == "11\n");
+static_assert(run<R"py(
+total = 0
+for a, b in zip((1, 2), (3, 4)):
+    total += a * b
+print(total)
+)py">().stdout() == "11\n");
 static_assert(run<"zip('a', 2)\n">().exception() == ctpy::TypeError);
 static_assert(run<"zip('a', 2)\n">().exception().message() == "'int' object is not iterable");
 
@@ -250,11 +268,12 @@ static_assert(eval<"sum(zip([1, 2], [3, 4])[0])">().to<int>() == 4);
 static_assert(eval<"max(sorted([3, 1, 2]))">().to<int>() == 3);
 static_assert(eval<"int(str(-321))">().to<int>() == -321);
 static_assert(eval<"str(min([2.5, 1.5]))">().str() == "1.5");
-static_assert(run<
-"def shout(xs):\n"
-"    print(len(xs), max(xs), sep=': ')\n"
-"\n"
-"shout([2, 7, 1])\n">().stdout() == "3: 7\n");
+static_assert(run<R"py(
+def shout(xs):
+    print(len(xs), max(xs), sep=': ')
+
+shout([2, 7, 1])
+)py">().stdout() == "3: 7\n");
 
 // v0.1: builtins are not first-class values (documented)
 static_assert(run<"f = len\n">().exception() == ctpy::NameError);

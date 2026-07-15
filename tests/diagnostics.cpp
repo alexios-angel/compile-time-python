@@ -27,8 +27,13 @@ static_assert(error_message<"x = 1\n">().empty());
 
 // a dedent to a depth that was never indented to is CPython's
 // IndentationError; it surfaces from the PRELEX stage with the line
-// and column of the offending statement
-inline constexpr auto bad_dedent = ctll::fixed_string{"if x:\n        a\n    b\n"};
+// and column of the offending statement. (Raw sources in this file are
+// ANCHORED against the opening delimiter - no leading blank line - so
+// the asserted line/column numbers stay exactly what a user would see.)
+inline constexpr auto bad_dedent = ctll::fixed_string{R"py(if x:
+        a
+    b
+)py"};
 static_assert(!is_valid<bad_dedent>);
 static_assert(!error_info<bad_dedent>().ok());
 static_assert(error_info<bad_dedent>().stage == error_stage::prelex);
@@ -39,7 +44,9 @@ static_assert(error_info<bad_dedent>().column == 5);
 static_assert(ctpy::prelex_diag<bad_dedent>.line == 3);
 
 // an unterminated string fails at its OPENING quote's line/column
-inline constexpr auto unterminated = ctll::fixed_string{"x = 'oops\ny = 1\n"};
+inline constexpr auto unterminated = ctll::fixed_string{R"py(x = 'oops
+y = 1
+)py"};
 static_assert(!is_valid<unterminated>);
 static_assert(error_info<unterminated>().stage == error_stage::prelex);
 static_assert(error_info<unterminated>().kind == error_kind::unterminated_string);
@@ -62,7 +69,9 @@ static_assert(error_info<dangling_plus>().line == 1);
 static_assert(error_info<dangling_plus>().column == 8);
 
 // ... and on the RIGHT physical line of a multi-line script
-inline constexpr auto second_line_bad = ctll::fixed_string{"x = 1\ny = (]\n"};
+inline constexpr auto second_line_bad = ctll::fixed_string{R"py(x = 1
+y = (]
+)py"};
 static_assert(!is_valid<second_line_bad>);
 static_assert(error_info<second_line_bad>().stage == error_stage::parse);
 static_assert(error_info<second_line_bad>().line == 2);
@@ -103,53 +112,59 @@ static_assert(run<"1/0\n">().exception().line == 1);
 static_assert(run<"1/0\n">().exception().message() == "division by zero");
 
 // the raising statement's own line, not the script's last
-static_assert(run<"x = 1\ny = 1 // 0\n">().exception().line == 2);
-static_assert(run<"x = 1\ny = 1 // 0\n">().exception() == ctpy::ZeroDivisionError);
+static_assert(run<R"py(x = 1
+y = 1 // 0
+)py">().exception().line == 2);
+static_assert(run<R"py(x = 1
+y = 1 // 0
+)py">().exception() == ctpy::ZeroDivisionError);
 
 // the README failure-policy snippet, verbatim
-constexpr auto boom = ctpy::run<"x = 1\ny = x // 0\n">();
+constexpr auto boom = ctpy::run<R"py(x = 1
+y = x // 0
+)py">();
 static_assert(!boom.ok());
 static_assert(boom.exception() == ctpy::ZeroDivisionError);
 static_assert(boom.exception().message() == "division by zero");
 static_assert(boom.exception().line == 2);  // like a traceback would say
 
 // a raise inside a function reports the line INSIDE the def
-static_assert(run<
-	"def f():\n"
-	"    return 1 // 0\n"
-	"\n"
-	"f()\n">().exception().line == 2);
+static_assert(run<R"py(def f():
+    return 1 // 0
+
+f()
+)py">().exception().line == 2);
 
 // a wrong-arity call reports the CALL line
-static_assert(run<
-	"def f(x):\n"
-	"    return x\n"
-	"\n"
-	"f()\n">().exception() == ctpy::TypeError);
-static_assert(run<
-	"def f(x):\n"
-	"    return x\n"
-	"\n"
-	"f()\n">().exception().line == 4);
+static_assert(run<R"py(def f(x):
+    return x
+
+f()
+)py">().exception() == ctpy::TypeError);
+static_assert(run<R"py(def f(x):
+    return x
+
+f()
+)py">().exception().line == 4);
 
 // a while TEST that raises on a LATER iteration still reports the
 // while line (loop headers re-stamp per evaluation)
-static_assert(run<
-	"n = 2\n"
-	"while 10 // n:\n"
-	"    n -= 1\n">().exception() == ctpy::ZeroDivisionError);
-static_assert(run<
-	"n = 2\n"
-	"while 10 // n:\n"
-	"    n -= 1\n">().exception().line == 2);
+static_assert(run<R"py(n = 2
+while 10 // n:
+    n -= 1
+)py">().exception() == ctpy::ZeroDivisionError);
+static_assert(run<R"py(n = 2
+while 10 // n:
+    n -= 1
+)py">().exception().line == 2);
 
 // an elif clause carries its OWN line
-static_assert(run<
-	"x = 1\n"
-	"if x == 0:\n"
-	"    pass\n"
-	"elif 1 // 0:\n"
-	"    pass\n">().exception().line == 4);
+static_assert(run<R"py(x = 1
+if x == 0:
+    pass
+elif 1 // 0:
+    pass
+)py">().exception().line == 4);
 
 // a non-iterable for reports the for line
 static_assert(run<"for i in 5:\n    pass\n">().exception() == ctpy::TypeError);
@@ -157,14 +172,14 @@ static_assert(run<"for i in 5:\n    pass\n">().exception().line == 1);
 
 // LOGICAL lines: a statement continued across physical lines (bracket
 // continuation) reports the line it STARTED on, like CPython
-static_assert(run<
-	"z = (1\n"
-	"     // 0)\n">().exception().line == 1);
+static_assert(run<R"py(z = (1
+     // 0)
+)py">().exception().line == 1);
 // ... and continuation before a raise does not shift later lines
-static_assert(run<
-	"x = (1 +\n"
-	"     2)\n"
-	"y = 1 // 0\n">().exception().line == 3);
+static_assert(run<R"py(x = (1 +
+     2)
+y = 1 // 0
+)py">().exception().line == 3);
 
 // an inline suite shares its header's line
 static_assert(run<"if True: x = 1 // 0\n">().exception().line == 1);

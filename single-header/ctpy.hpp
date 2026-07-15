@@ -10533,7 +10533,7 @@ constexpr std::uint32_t call_builtin(St & st, std::string_view name,
 	return st.raise_error(ex_kind::NameError, {"name '", name, "' is not defined"});
 }
 
-// --- methods (the minimal v0.1 set) --------------------------------------------
+// --- methods (list/dict/file, plus the str set below) ---------------------------
 
 // dict.keys()/.values()/.items() return materialized LISTS (v0.1 has no
 // view objects; CPython code that iterates or len()s them works the
@@ -10563,10 +10563,620 @@ constexpr std::uint32_t dict_view_list(St & st, const Object & self, int which) 
 	return st.push(Object{.kind = Kind::list, .first = first, .count = self.count});
 }
 
+// --- the str method set (ASCII semantics) ---------------------------------------
+//
+// Every method matches CPython 3.14 (values AND error spellings) over
+// ASCII text. Documented v0.1 deviations, all soft errors or noted:
+//   - case/predicate methods use ASCII rules (bytes above 0x7f are
+//     uncased, non-alphanumeric, non-space); splitlines() splits on the
+//     ASCII boundaries \n \r \r\n \v \f \x1c \x1d \x1e (CPython's str
+//     also treats U+0085/U+2028/U+2029 as boundaries);
+//   - find/rfind/index/rindex/count/startswith/endswith take only the
+//     substring argument (CPython's start/end slice forms raise a soft
+//     "ctpy v0.1" TypeError);
+//   - startswith/endswith take a single str (CPython also accepts a
+//     tuple of str - here that is a soft "ctpy v0.1" TypeError);
+//   - splitlines() takes no arguments (no keepends form).
+//
+// str objects are index ranges into the char pool and immutable, so
+// substring results SHARE the receiver's run (str_share) and identity
+// results return `self`; only the case/pad/join/replace builders append
+// fresh characters.
+
+constexpr bool ascii_space(char unit) noexcept {
+	return unit == ' ' || unit == '\t' || unit == '\n' || unit == '\r' ||
+	       unit == '\v' || unit == '\f';
+}
+constexpr bool ascii_upper(char unit) noexcept {
+	return unit >= 'A' && unit <= 'Z';
+}
+constexpr bool ascii_lower(char unit) noexcept {
+	return unit >= 'a' && unit <= 'z';
+}
+constexpr bool ascii_alpha(char unit) noexcept {
+	return ascii_upper(unit) || ascii_lower(unit);
+}
+constexpr bool ascii_digit(char unit) noexcept {
+	return unit >= '0' && unit <= '9';
+}
+constexpr bool ascii_linebreak(char unit) noexcept {
+	return unit == '\n' || unit == '\r' || unit == '\v' || unit == '\f' ||
+	       unit == '\x1c' || unit == '\x1d' || unit == '\x1e';
+}
+constexpr char ascii_toupper(char unit) noexcept {
+	return ascii_lower(unit) ? static_cast<char>(unit - ('a' - 'A')) : unit;
+}
+constexpr char ascii_tolower(char unit) noexcept {
+	return ascii_upper(unit) ? static_cast<char>(unit + ('a' - 'A')) : unit;
+}
+
+// a substring of an existing str, SHARING its char run (strs are immutable)
+template <typename St>
+constexpr std::uint32_t str_share(St & st, const Object & source, std::size_t from,
+                                  std::size_t count) {
+	return st.push(Object{.kind = Kind::str,
+	                      .first = source.first + static_cast<std::uint32_t>(from),
+	                      .count = static_cast<std::uint32_t>(count)});
+}
+
+// the CPython arity spellings "str.upper() takes no arguments (1 given)" /
+// "str.zfill() takes exactly one argument (2 given)"
+template <typename St>
+constexpr std::uint32_t str_arity_error(St & st, std::string_view name,
+                                        std::string_view expected, std::size_t argc) {
+	const auto got = dec(static_cast<long long>(argc));
+	return st.raise_error(ex_kind::TypeError,
+		{"str.", name, "() takes ", expected, " (", got.view(), " given)"});
+}
+
+// split/rsplit share one core. Whitespace mode (no sep, or sep=None)
+// splits on ASCII whitespace runs and never yields empty pieces; an
+// explicit sep preserves them ("a,,b" -> ['a', '', 'b']). maxsplit < 0
+// means unlimited; rsplit anchors the limit at the RIGHT end, so its
+// pieces are minted right-to-left and mirrored into a forward run.
+template <typename St>
+constexpr std::uint32_t str_split(St & st, const Object & self_obj, bool right,
+                                  const std::uint32_t * argv, std::size_t argc) {
+	const std::string_view name = right ? "rsplit" : "split";
+	if (argc > 2) {
+		const auto got = dec(static_cast<long long>(argc));
+		return st.raise_error(ex_kind::TypeError,
+			{name, "() takes at most 2 arguments (", got.view(), " given)"});
+	}
+	bool whitespace = true;
+	std::string_view sep{};
+	if (argc >= 1 && st.a.objs[argv[0]].kind != Kind::none) {
+		const Object & sep_obj = st.a.objs[argv[0]];
+		if (sep_obj.kind != Kind::str) {
+			return st.raise_error(ex_kind::TypeError,
+				{"must be str or None, not ", type_name(sep_obj.kind)});
+		}
+		if (sep_obj.count == 0) {
+			return st.raise_error(ex_kind::ValueError, "empty separator");
+		}
+		whitespace = false;
+		sep = st.str_of(sep_obj);
+	}
+	long long maxsplit = -1;
+	if (argc == 2) {
+		const Object & limit = st.a.objs[argv[1]];
+		if (!is_int_like(limit.kind)) {
+			return st.raise_error(ex_kind::TypeError,
+				{"'", type_name(limit.kind), "' object cannot be interpreted as an integer"});
+		}
+		maxsplit = limit.i;
+	}
+	const std::string_view text = st.str_of(self_obj);
+	const std::size_t size = text.size();
+	const std::uint32_t run = static_cast<std::uint32_t>(st.a.objs.size());
+	std::uint32_t pieces = 0;
+	long long done = 0;
+	if (whitespace && !right) {
+		std::size_t at = 0;
+		while (true) {
+			while (at < size && ascii_space(text[at])) {
+				++at;
+			}
+			if (at >= size) {
+				break;
+			}
+			std::size_t stop = size; // maxsplit reached: the rest is one piece
+			if (maxsplit < 0 || done < maxsplit) {
+				stop = at;
+				while (stop < size && !ascii_space(text[stop])) {
+					++stop;
+				}
+			}
+			str_share(st, self_obj, at, stop - at);
+			++pieces;
+			++done;
+			at = stop;
+		}
+	} else if (whitespace) { // right-anchored whitespace: pieces right-to-left
+		std::size_t at = size;
+		while (true) {
+			while (at > 0 && ascii_space(text[at - 1])) {
+				--at;
+			}
+			if (at == 0) {
+				break;
+			}
+			std::size_t start = 0; // maxsplit reached: the rest is one piece
+			if (maxsplit < 0 || done < maxsplit) {
+				start = at;
+				while (start > 0 && !ascii_space(text[start - 1])) {
+					--start;
+				}
+			}
+			str_share(st, self_obj, start, at - start);
+			++pieces;
+			++done;
+			at = start;
+		}
+	} else if (!right) {
+		std::size_t at = 0;
+		while (maxsplit < 0 || done < maxsplit) {
+			const std::size_t pos = text.find(sep, at);
+			if (pos == std::string_view::npos) {
+				break;
+			}
+			str_share(st, self_obj, at, pos - at);
+			++pieces;
+			++done;
+			at = pos + sep.size();
+		}
+		str_share(st, self_obj, at, size - at);
+		++pieces;
+	} else { // right-anchored sep: pieces right-to-left
+		std::size_t at = size;
+		while ((maxsplit < 0 || done < maxsplit) && at >= sep.size()) {
+			const std::size_t pos = text.rfind(sep, at - sep.size());
+			if (pos == std::string_view::npos) {
+				break;
+			}
+			str_share(st, self_obj, pos + sep.size(), at - pos - sep.size());
+			++pieces;
+			++done;
+			at = pos;
+		}
+		str_share(st, self_obj, 0, at);
+		++pieces;
+	}
+	if (!right) {
+		return st.push(Object{.kind = Kind::list, .first = run, .count = pieces});
+	}
+	const std::uint32_t forward = static_cast<std::uint32_t>(st.a.objs.size());
+	for (std::uint32_t at = pieces; at > 0; --at) {
+		st.a.objs.push_back(st.a.objs[run + at - 1]);
+	}
+	return st.push(Object{.kind = Kind::list, .first = forward, .count = pieces});
+}
+
+// dispatch for every str method; `object` is the caller's COPY of the
+// receiver (the pools below may grow). An unknown name is CPython's
+// AttributeError, exactly like every other kind.
+template <typename St>
+constexpr std::uint32_t call_str_method(St & st, std::uint32_t self, const Object & object,
+                                        std::string_view name,
+                                        const std::uint32_t * argv, std::size_t argc) {
+	if (name == "split" || name == "rsplit") {
+		return str_split(st, object, name == "rsplit", argv, argc);
+	}
+	if (name == "splitlines") {
+		if (argc != 0) {
+			return st.raise_error(ex_kind::TypeError,
+				"ctpy v0.1: splitlines() takes no arguments (no keepends form)");
+		}
+		const std::string_view text = st.str_of(object);
+		const std::size_t size = text.size();
+		const std::uint32_t run = static_cast<std::uint32_t>(st.a.objs.size());
+		std::uint32_t pieces = 0;
+		std::size_t at = 0;
+		while (at < size) { // a trailing boundary adds no empty piece
+			const std::size_t from = at;
+			while (at < size && !ascii_linebreak(text[at])) {
+				++at;
+			}
+			str_share(st, object, from, at - from);
+			++pieces;
+			if (at < size) {
+				at += (text[at] == '\r' && at + 1 < size && text[at + 1] == '\n') ? 2u : 1u;
+			}
+		}
+		return st.push(Object{.kind = Kind::list, .first = run, .count = pieces});
+	}
+	if (name == "join") {
+		if (argc != 1) {
+			return str_arity_error(st, "join", "exactly one argument", argc);
+		}
+		const Object sequence = st.a.objs[argv[0]]; // copy: materializing allocates
+		if (!iterable_kind(sequence.kind)) {
+			return st.raise_error(ex_kind::TypeError, "can only join an iterable");
+		}
+		// two-phase like f-strings: materialize + type-check first (may
+		// allocate), THEN open the result and append (allocates nothing)
+		const long long total = iter_len(st, sequence);
+		const std::uint32_t elements = materialize_run(st, sequence);
+		for (long long at = 0; at < total; ++at) {
+			const Object & element = st.a.objs[elements + static_cast<std::uint32_t>(at)];
+			if (element.kind != Kind::str) {
+				const auto slot = dec(at);
+				return st.raise_error(ex_kind::TypeError,
+					{"sequence item ", slot.view(), ": expected str instance, ",
+					 type_name(element.kind), " found"});
+			}
+		}
+		const std::uint32_t out = st.make_str_here();
+		for (long long at = 0; at < total; ++at) {
+			if (at != 0) {
+				st.str_append(out, st.str_of(object));
+			}
+			st.str_append(out, st.str_of(st.a.objs[elements + static_cast<std::uint32_t>(at)]));
+		}
+		return out;
+	}
+	const int strip_mode = name == "strip" ? 0 : name == "lstrip" ? 1 : name == "rstrip" ? 2 : -1;
+	if (strip_mode >= 0) {
+		if (argc > 1) {
+			const auto got = dec(static_cast<long long>(argc));
+			return st.raise_error(ex_kind::TypeError,
+				{name, " expected at most 1 argument, got ", got.view()});
+		}
+		bool default_set = true; // ASCII whitespace; an explicit chars str is a SET
+		std::string_view chars{};
+		if (argc == 1 && st.a.objs[argv[0]].kind != Kind::none) {
+			const Object & given = st.a.objs[argv[0]];
+			if (given.kind != Kind::str) {
+				return st.raise_error(ex_kind::TypeError, {name, " arg must be None or str"});
+			}
+			default_set = false;
+			chars = st.str_of(given);
+		}
+		const std::string_view text = st.str_of(object);
+		const auto in_set = [default_set, chars](char unit) {
+			return default_set ? ascii_space(unit)
+			                   : chars.find(unit) != std::string_view::npos;
+		};
+		std::size_t from = 0;
+		std::size_t to = text.size();
+		if (strip_mode != 2) {
+			while (from < to && in_set(text[from])) {
+				++from;
+			}
+		}
+		if (strip_mode != 1) {
+			while (to > from && in_set(text[to - 1])) {
+				--to;
+			}
+		}
+		return str_share(st, object, from, to - from);
+	}
+	if (name == "upper" || name == "lower" || name == "casefold" || name == "swapcase" ||
+	    name == "capitalize" || name == "title") {
+		if (argc != 0) {
+			return str_arity_error(st, name, "no arguments", argc);
+		}
+		const std::string_view text = st.str_of(object);
+		const std::uint32_t out = st.make_str_here();
+		if (name == "upper") {
+			for (const char unit : text) {
+				st.str_push(out, ascii_toupper(unit));
+			}
+		} else if (name == "lower" || name == "casefold") { // casefold == lower in ASCII
+			for (const char unit : text) {
+				st.str_push(out, ascii_tolower(unit));
+			}
+		} else if (name == "swapcase") {
+			for (const char unit : text) {
+				st.str_push(out, ascii_upper(unit) ? ascii_tolower(unit) : ascii_toupper(unit));
+			}
+		} else if (name == "capitalize") {
+			for (std::size_t at = 0; at < text.size(); ++at) {
+				st.str_push(out, at == 0 ? ascii_toupper(text[at]) : ascii_tolower(text[at]));
+			}
+		} else { // title: a cased char after an uncased one starts a word ('a1a' -> 'A1A')
+			bool prev_cased = false;
+			for (const char unit : text) {
+				const bool cased = ascii_alpha(unit);
+				st.str_push(out, cased && !prev_cased ? ascii_toupper(unit) : ascii_tolower(unit));
+				prev_cased = cased;
+			}
+		}
+		return out;
+	}
+	if (name == "replace") {
+		if (argc < 2) {
+			const auto got = dec(static_cast<long long>(argc));
+			return st.raise_error(ex_kind::TypeError,
+				{"replace() takes at least 2 positional arguments (", got.view(), " given)"});
+		}
+		if (argc > 3) {
+			const auto got = dec(static_cast<long long>(argc));
+			return st.raise_error(ex_kind::TypeError,
+				{"replace() takes at most 3 arguments (", got.view(), " given)"});
+		}
+		const Object & old_obj = st.a.objs[argv[0]];
+		const Object & new_obj = st.a.objs[argv[1]];
+		if (old_obj.kind != Kind::str) {
+			return st.raise_error(ex_kind::TypeError,
+				{"replace() argument 1 must be str, not ", type_name(old_obj.kind)});
+		}
+		if (new_obj.kind != Kind::str) {
+			return st.raise_error(ex_kind::TypeError,
+				{"replace() argument 2 must be str, not ", type_name(new_obj.kind)});
+		}
+		long long count = -1; // negative means unlimited, like CPython
+		if (argc == 3) {
+			const Object & limit = st.a.objs[argv[2]];
+			if (!is_int_like(limit.kind)) {
+				return st.raise_error(ex_kind::TypeError,
+					{"'", type_name(limit.kind), "' object cannot be interpreted as an integer"});
+			}
+			count = limit.i;
+		}
+		const std::string_view text = st.str_of(object);
+		const std::string_view old_part = st.str_of(old_obj);
+		const std::string_view new_part = st.str_of(new_obj);
+		const std::uint32_t out = st.make_str_here();
+		long long done = 0;
+		if (old_part.empty()) { // CPython inserts between characters and at both ends
+			for (std::size_t at = 0; at <= text.size(); ++at) {
+				if (count < 0 || done < count) {
+					st.str_append(out, new_part);
+					++done;
+				}
+				if (at < text.size()) {
+					st.str_push(out, text[at]);
+				}
+			}
+			return out;
+		}
+		std::size_t at = 0;
+		while (count < 0 || done < count) {
+			const std::size_t pos = text.find(old_part, at);
+			if (pos == std::string_view::npos) {
+				break;
+			}
+			st.str_append(out, text.substr(at, pos - at));
+			st.str_append(out, new_part);
+			at = pos + old_part.size();
+			++done;
+		}
+		st.str_append(out, text.substr(at));
+		return out;
+	}
+	if (name == "find" || name == "rfind" || name == "index" || name == "rindex" ||
+	    name == "count") {
+		if (argc == 0) {
+			return st.raise_error(ex_kind::TypeError,
+				{name, " expected at least 1 argument, got 0"});
+		}
+		if (argc > 1) { // documented v0.1 deviation: no start/end slice form
+			return st.raise_error(ex_kind::TypeError,
+				{"ctpy v0.1: ", name, "() takes exactly one argument (no start/end form)"});
+		}
+		const Object & needle_obj = st.a.objs[argv[0]];
+		if (needle_obj.kind != Kind::str) {
+			return st.raise_error(ex_kind::TypeError,
+				{name, "() argument 1 must be str, not ", type_name(needle_obj.kind)});
+		}
+		const std::string_view text = st.str_of(object);
+		const std::string_view needle = st.str_of(needle_obj);
+		if (name == "count") { // non-overlapping; '' matches len+1 times
+			if (needle.empty()) {
+				return st.make_int(static_cast<long long>(text.size()) + 1);
+			}
+			long long hits = 0;
+			std::size_t at = 0;
+			while (true) {
+				const std::size_t pos = text.find(needle, at);
+				if (pos == std::string_view::npos) {
+					break;
+				}
+				++hits;
+				at = pos + needle.size();
+			}
+			return st.make_int(hits);
+		}
+		const bool reverse = name == "rfind" || name == "rindex";
+		const std::size_t pos = reverse ? text.rfind(needle) : text.find(needle);
+		if (pos == std::string_view::npos) {
+			if (name == "index" || name == "rindex") {
+				return st.raise_error(ex_kind::ValueError, "substring not found");
+			}
+			return st.make_int(-1);
+		}
+		return st.make_int(static_cast<long long>(pos));
+	}
+	if (name == "startswith" || name == "endswith") {
+		if (argc == 0) {
+			return st.raise_error(ex_kind::TypeError,
+				{name, " expected at least 1 argument, got 0"});
+		}
+		if (argc > 1) { // documented v0.1 deviation: no start/end slice form
+			return st.raise_error(ex_kind::TypeError,
+				{"ctpy v0.1: ", name, "() takes exactly one argument (no start/end form)"});
+		}
+		const Object & given = st.a.objs[argv[0]];
+		if (given.kind == Kind::tuple) { // documented v0.1 deviation: no tuple form
+			return st.raise_error(ex_kind::TypeError,
+				{"ctpy v0.1: ", name, "() takes a single str (no tuple form)"});
+		}
+		if (given.kind != Kind::str) {
+			return st.raise_error(ex_kind::TypeError,
+				{name, " first arg must be str or a tuple of str, not ", type_name(given.kind)});
+		}
+		const std::string_view text = st.str_of(object);
+		const std::string_view part = st.str_of(given);
+		return st.make_bool(name == "startswith" ? text.starts_with(part)
+		                                         : text.ends_with(part));
+	}
+	if (name == "isdigit" || name == "isalpha" || name == "isalnum" || name == "isspace" ||
+	    name == "isupper" || name == "islower") {
+		if (argc != 0) {
+			return str_arity_error(st, name, "no arguments", argc);
+		}
+		const std::string_view text = st.str_of(object);
+		if (name == "isupper" || name == "islower") {
+			// at least one cased char, and every cased char matches
+			bool any_cased = false;
+			bool all_match = true;
+			const bool want_upper = name == "isupper";
+			for (const char unit : text) {
+				if (ascii_alpha(unit)) {
+					any_cased = true;
+					all_match = all_match && (want_upper ? ascii_upper(unit) : ascii_lower(unit));
+				}
+			}
+			return st.make_bool(any_cased && all_match);
+		}
+		bool all = !text.empty(); // the empty str is False for every predicate
+		for (const char unit : text) {
+			const bool good = name == "isdigit"   ? ascii_digit(unit)
+			                  : name == "isalpha" ? ascii_alpha(unit)
+			                  : name == "isalnum" ? (ascii_alpha(unit) || ascii_digit(unit))
+			                                      : ascii_space(unit);
+			all = all && good;
+		}
+		return st.make_bool(all);
+	}
+	if (name == "zfill") {
+		if (argc != 1) {
+			return str_arity_error(st, "zfill", "exactly one argument", argc);
+		}
+		const Object & width_obj = st.a.objs[argv[0]];
+		if (!is_int_like(width_obj.kind)) {
+			return st.raise_error(ex_kind::TypeError,
+				{"'", type_name(width_obj.kind), "' object cannot be interpreted as an integer"});
+		}
+		const std::string_view text = st.str_of(object);
+		const long long width = width_obj.i;
+		if (width <= static_cast<long long>(text.size())) {
+			return self; // strs are immutable: share the object
+		}
+		const std::uint32_t out = st.make_str_here();
+		std::size_t from = 0;
+		if (!text.empty() && (text[0] == '+' || text[0] == '-')) {
+			st.str_push(out, text[0]); // the sign stays ahead of the zeros
+			from = 1;
+		}
+		for (long long fill = width - static_cast<long long>(text.size()); fill > 0; --fill) {
+			st.str_push(out, '0');
+		}
+		st.str_append(out, text.substr(from));
+		return out;
+	}
+	if (name == "ljust" || name == "rjust" || name == "center") {
+		if (argc == 0) {
+			return st.raise_error(ex_kind::TypeError,
+				{name, " expected at least 1 argument, got 0"});
+		}
+		if (argc > 2) {
+			const auto got = dec(static_cast<long long>(argc));
+			return st.raise_error(ex_kind::TypeError,
+				{name, " expected at most 2 arguments, got ", got.view()});
+		}
+		const Object & width_obj = st.a.objs[argv[0]];
+		if (!is_int_like(width_obj.kind)) {
+			return st.raise_error(ex_kind::TypeError,
+				{"'", type_name(width_obj.kind), "' object cannot be interpreted as an integer"});
+		}
+		char fill = ' '; // validated even when width <= len, like CPython
+		if (argc == 2) {
+			const Object & fill_obj = st.a.objs[argv[1]];
+			if (fill_obj.kind != Kind::str) {
+				return st.raise_error(ex_kind::TypeError,
+					{"The fill character must be a unicode character, not ",
+					 type_name(fill_obj.kind)});
+			}
+			if (fill_obj.count != 1) {
+				return st.raise_error(ex_kind::TypeError,
+					"The fill character must be exactly one character long");
+			}
+			fill = st.a.chars[fill_obj.first];
+		}
+		const std::string_view text = st.str_of(object);
+		const long long width = width_obj.i;
+		const long long length = static_cast<long long>(text.size());
+		if (width <= length) {
+			return self; // strs are immutable: share the object
+		}
+		const long long margin = width - length;
+		long long left = 0;
+		if (name == "rjust") {
+			left = margin;
+		} else if (name == "center") { // CPython: an odd margin leans by width parity
+			left = margin / 2 + (margin & width & 1);
+		}
+		const std::uint32_t out = st.make_str_here();
+		for (long long at = 0; at < left; ++at) {
+			st.str_push(out, fill);
+		}
+		st.str_append(out, text);
+		for (long long at = left; at < margin; ++at) {
+			st.str_push(out, fill);
+		}
+		return out;
+	}
+	if (name == "removeprefix" || name == "removesuffix") {
+		if (argc != 1) {
+			return str_arity_error(st, name, "exactly one argument", argc);
+		}
+		const Object & part_obj = st.a.objs[argv[0]];
+		if (part_obj.kind != Kind::str) {
+			return st.raise_error(ex_kind::TypeError,
+				{name, "() argument must be str, not ", type_name(part_obj.kind)});
+		}
+		const std::string_view text = st.str_of(object);
+		const std::string_view part = st.str_of(part_obj);
+		if (name == "removeprefix") {
+			return text.starts_with(part)
+				? str_share(st, object, part.size(), text.size() - part.size())
+				: self;
+		}
+		return text.ends_with(part) ? str_share(st, object, 0, text.size() - part.size())
+		                            : self;
+	}
+	if (name == "partition" || name == "rpartition") {
+		if (argc != 1) {
+			return str_arity_error(st, name, "exactly one argument", argc);
+		}
+		const Object & sep_obj = st.a.objs[argv[0]];
+		if (sep_obj.kind != Kind::str) {
+			return st.raise_error(ex_kind::TypeError,
+				{"must be str, not ", type_name(sep_obj.kind)});
+		}
+		if (sep_obj.count == 0) {
+			return st.raise_error(ex_kind::ValueError, "empty separator");
+		}
+		const std::string_view text = st.str_of(object);
+		const std::string_view sep = st.str_of(sep_obj);
+		const bool reverse = name == "rpartition";
+		const std::size_t pos = reverse ? text.rfind(sep) : text.find(sep);
+		const std::uint32_t run = static_cast<std::uint32_t>(st.a.objs.size());
+		if (pos == std::string_view::npos) {
+			// miss: (self, '', '') left-anchored, ('', '', self) right-anchored
+			str_share(st, object, 0, reverse ? 0 : text.size());
+			str_share(st, object, reverse ? 0 : text.size(), 0);
+			str_share(st, object, 0, reverse ? text.size() : 0);
+		} else {
+			str_share(st, object, 0, pos);
+			str_share(st, object, pos, sep.size());
+			str_share(st, object, pos + sep.size(), text.size() - pos - sep.size());
+		}
+		return st.push(Object{.kind = Kind::tuple, .first = run, .count = 3});
+	}
+	return st.raise_error(ex_kind::AttributeError,
+		{"'str' object has no attribute '", name, "'"});
+}
+
 template <typename St>
 constexpr std::uint32_t call_method(St & st, std::uint32_t self, std::string_view name,
                                     const std::uint32_t * argv, std::size_t argc) {
 	const Object object = st.a.objs[self]; // copy: methods below may grow the pool
+	if (object.kind == Kind::str) {
+		return call_str_method(st, self, object, name, argv, argc);
+	}
 	if (object.kind == Kind::file && name == "read") {
 		if (argc != 0) {
 			return st.raise_error(ex_kind::TypeError,

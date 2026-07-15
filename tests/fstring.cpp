@@ -37,7 +37,10 @@ static_assert(eval<"f'{(1, 2)[0]}'">().str() == "1");
 
 // adjacent holes, evaluated left to right
 static_assert(eval<"f'{1}{2}'">().str() == "12");
-static_assert(run<"x = 3\ns = f'{x}{x + 1}{x * 2}'\n">()["s"].str() == "346");
+static_assert(run<R"py(
+x = 3
+s = f'{x}{x + 1}{x * 2}'
+)py">()["s"].str() == "346");
 
 // str() conversion, not repr: strs interpolate unquoted...
 static_assert(eval<"f\"{'s'}\"">().str() == "s");
@@ -47,7 +50,10 @@ static_assert(eval<"f\"{[1, 'a']}\"">().str() == "[1, 'a']");
 static_assert(eval<"f'{range(3)}'">().str() == "range(0, 3)");
 
 // quotes and brackets INSIDE a hole do not close it
-static_assert(run<"d = {'k': 5}\ns = f'{d[\"k\"]}'\n">()["s"].str() == "5");
+static_assert(run<R"py(
+d = {'k': 5}
+s = f'{d["k"]}'
+)py">()["s"].str() == "5");
 static_assert(eval<"f\"{'nested {braces}' + '!'}\"">().str() == "nested {braces}!");
 static_assert(eval<"f'{ {1: 2}[1] }'">().str() == "2"); // a dict display in a hole
 static_assert(eval<"f'{1 != 2}'">().str() == "True");   // '!=' is not a conversion
@@ -57,27 +63,33 @@ static_assert(eval<"f\"{f'{1 + 1}'}\"">().str() == "2");
 
 // --- f-strings inside programs ------------------------------------------------------
 
-static_assert(run<"x = 7\ny = f'x={x}!'\n">()["y"].str() == "x=7!");
+static_assert(run<R"py(
+x = 7
+y = f'x={x}!'
+)py">()["y"].str() == "x=7!");
 static_assert(run<"print(f'v={2 ** 3}')\n">().stdout() == "v=8\n");
-static_assert(run<
-"total = 0\n"
-"for i in range(4):\n"
-"    total += i\n"
-"print(f'total is {total}')\n">().stdout() == "total is 6\n");
-static_assert(run<
-"def greet(name):\n"
-"    return f'hello, {name}!'\n"
-"\n"
-"print(greet('world'))\n">().stdout() == "hello, world!\n");
+static_assert(run<R"py(
+total = 0
+for i in range(4):
+    total += i
+print(f'total is {total}')
+)py">().stdout() == "total is 6\n");
+static_assert(run<R"py(
+def greet(name):
+    return f'hello, {name}!'
+
+print(greet('world'))
+)py">().stdout() == "hello, world!\n");
 
 // names resolve in the CURRENT scope, per Python
-static_assert(run<
-"x = 'global'\n"
-"def f():\n"
-"    x = 'local'\n"
-"    return f'{x}'\n"
-"\n"
-"y = f()\n">()["y"].str() == "local");
+static_assert(run<R"py(
+x = 'global'
+def f():
+    x = 'local'
+    return f'{x}'
+
+y = f()
+)py">()["y"].str() == "local");
 
 // --- the soft channel threads through holes --------------------------------------------
 

@@ -136,7 +136,13 @@ comparisons, in/is, bitwise, shifts, arithmetic, unary, `**`); calls,
 indexing, slicing, method attributes; if/elif/else, while/for
 (+break/continue/else); def with default args and recursion (RecursionError
 guard at depth 100, no closures); print (sep/end), len, range, sum, min,
-max, abs, str, int, bool, sorted, enumerate, zip, open, input; f-strings
+max, abs, str, int, bool, sorted, enumerate, zip, open, input; the str
+method set with ASCII semantics — split/rsplit/splitlines, join,
+strip/lstrip/rstrip, upper/lower/casefold/swapcase/capitalize/title,
+replace, find/rfind/index/rindex/count, startswith/endswith,
+isdigit/isalpha/isalnum/isspace/isupper/islower, zfill/ljust/rjust/center,
+removeprefix/removesuffix, partition/rpartition — plus list.append,
+dict.keys/.values/.items/.get; f-strings
 (`{expr}`, no format specs); the whole C++ boundary above — results
 right-sized into per-script static storage, `ctpy::value` views, `arg<>`
 in, `lift<>` out, the `file<>`/`stdin_text<>` IO seam; and the full
@@ -151,9 +157,10 @@ Deferred beyond v0.1: classes, generators, comprehensions, try/except,
 import execution, with, decorators, async. Documented deviations (ints are
 64-bit — overflow raises where CPython grows a bignum; floats print with 16
 significant digits; enumerate/zip materialize; calls are positional-only
-except print; exception lines are per-statement, so an expression inside a
-multi-line statement reports the statement's first line) live in PLAN.md's
-progress notes. Still to come for v0.1: the release scaffolding (CI,
+except print; str methods are ASCII-semantics and take no start/end,
+tuple-prefix, or keepends forms; exception lines are per-statement, so an
+expression inside a multi-line statement reports the statement's first
+line) live in PLAN.md's progress notes. Still to come for v0.1: the release scaffolding (CI,
 examples, single-header).
 
 ## Build & test

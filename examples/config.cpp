@@ -8,17 +8,8 @@
 constexpr auto out = ctpy::run<R"py(
 raw = open("limits.conf").read()
 scaled = []
-n = 0
-seen = False
-for ch in raw:
-    if ch == " " or ch == "\n":
-        if seen:
-            scaled.append(n * factor)
-        n = 0
-        seen = False
-    else:
-        n = n * 10 + int(ch)
-        seen = True
+for entry in raw.split():
+    scaled.append(int(entry) * factor)
 total = sum(scaled)
 )py">(ctpy::arg<"factor">(10),
       ctpy::file<"limits.conf", "1 2 3 4\n">);

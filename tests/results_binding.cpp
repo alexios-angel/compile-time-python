@@ -95,19 +95,20 @@ static_assert(fed["who"].str() == "world");
 
 namespace views {
 
-constexpr auto out = run<
-"answer = 6 * 7\n"
-"pi = 3.5\n"
-"flag = True\n"
-"nothing = None\n"
-"name = 'ada'\n"
-"xs = [1, [2, 3], 'hi']\n"
-"t = (10, 20)\n"
-"s = {9}\n"
-"d = {'a': {'b': [10, 20]}, 1: 'one'}\n"
-"r = range(2, 12, 3)\n"
-"def f():\n"
-"    return 1\n">();
+constexpr auto out = run<R"py(
+answer = 6 * 7
+pi = 3.5
+flag = True
+nothing = None
+name = 'ada'
+xs = [1, [2, 3], 'hi']
+t = (10, 20)
+s = {9}
+d = {'a': {'b': [10, 20]}, 1: 'one'}
+r = range(2, 12, 3)
+def f():
+    return 1
+)py">();
 
 // kinds and scalar conversions
 static_assert(out["answer"].kind == Kind::int_ && out["answer"].to<long long>() == 42);
@@ -214,12 +215,20 @@ constexpr bool globals_iterate = [] {
 static_assert(globals_iterate);
 
 // deep aliasing survives the flatten: both names see the same content
-constexpr auto aliased = run<"a = [1, {'k': 2}]\nb = a\n">();
+constexpr auto aliased = run<R"py(
+a = [1, {'k': 2}]
+b = a
+)py">();
 static_assert(aliased["b"][1]["k"].to<int>() == 2);
 static_assert(aliased["a"][1]["k"].to<int>() == aliased["b"][1]["k"].to<int>());
 
 // a raising script still exposes stdout and the pre-raise globals
-constexpr auto raised = run<"x = 41\nprint('pre')\ny = 1 // 0\nz = 5\n">();
+constexpr auto raised = run<R"py(
+x = 41
+print('pre')
+y = 1 // 0
+z = 5
+)py">();
 static_assert(!raised.ok() && raised.exception() == ctpy::ZeroDivisionError);
 static_assert(raised.stdout() == "pre\n");
 static_assert(raised["x"].to<int>() == 41 && !raised["z"].exists());
@@ -270,13 +279,14 @@ static_assert(pair["z"].to<int>() == 42 && pair["a"].to<int>() == 6);
 
 namespace lift_out {
 
-constexpr auto out = run<
-"xs = [4, 5, 6]\n"
-"fs = (0.5, 1.5)\n"
-"s = 'lift me'\n"
-"r = range(3)\n"
-"d = {1: 10, 2: 20}\n"
-"nested = [[1], [2, 3]]\n">();
+constexpr auto out = run<R"py(
+xs = [4, 5, 6]
+fs = (0.5, 1.5)
+s = 'lift me'
+r = range(3)
+d = {1: 10, 2: 20}
+nested = [[1], [2, 3]]
+)py">();
 
 constexpr auto xs = ctpy::lift<ctc::vector<long long, 8>>(out["xs"]);
 static_assert(xs.size() == 3 && xs[0] == 4 && xs[2] == 6);
@@ -313,11 +323,12 @@ static_assert(run<"f = open('nope.txt')\n">().exception().message()
 	== "[Errno 2] No such file or directory: 'nope.txt'");
 
 // mounted: open() succeeds, read() hands the contents over
-constexpr auto io = run<
-"f = open('a.txt')\n"
-"first = f.read()\n"
-"second = f.read()\n"
-"other = open('b.txt').read()\n">(
+constexpr auto io = run<R"py(
+f = open('a.txt')
+first = f.read()
+second = f.read()
+other = open('b.txt').read()
+)py">(
 	ctpy::file<"a.txt", "alpha\n">, ctpy::file<"b.txt", "beta">);
 static_assert(io.ok());
 static_assert(io["f"].kind == Kind::file);
@@ -344,10 +355,11 @@ static_assert(run<"open('a', 'w')\n">().exception() == ctpy::TypeError);
 
 namespace stdin_feed {
 
-constexpr auto fed = run<
-"a = input()\n"
-"b = input('? ')\n"
-"c = input()\n">(ctpy::stdin_text<"one\ntwo\nlast">);
+constexpr auto fed = run<R"py(
+a = input()
+b = input('? ')
+c = input()
+)py">(ctpy::stdin_text<"one\ntwo\nlast">);
 static_assert(fed.ok());
 static_assert(fed["a"].str() == "one");   // the newline is consumed, not kept
 static_assert(fed["b"].str() == "two");
@@ -357,8 +369,10 @@ static_assert(fed.stdout() == "? ");      // the prompt printed, no newline
 // reading past the end (or with nothing mounted) is CPython's EOFError
 static_assert(run<"input()\n">().exception() == ctpy::EOFError);
 static_assert(run<"input()\n">().exception().message() == "EOF when reading a line");
-static_assert(run<"input()\ninput()\n">(ctpy::stdin_text<"only\n">).exception()
-	== ctpy::EOFError);
+static_assert(run<R"py(
+input()
+input()
+)py">(ctpy::stdin_text<"only\n">).exception() == ctpy::EOFError);
 static_assert(run<"input(1, 2)\n">().exception() == ctpy::TypeError);
 
 } // namespace stdin_feed
@@ -370,9 +384,15 @@ namespace registry {
 // mounting is accepted by run<> and validates the source parses;
 // import execution is deferred, so the descriptor is inert for now
 constexpr auto shaped = run<"x = 1\n">(
-	ctpy::pymodule<"helpers", "def h():\n    return 1\n">);
+	ctpy::pymodule<"helpers", R"py(
+def h():
+    return 1
+)py">);
 static_assert(shaped.ok() && shaped["x"].to<int>() == 1);
-static_assert(ctpy::pymodule<"helpers", "def h():\n    return 1\n">.name() == "helpers");
+static_assert(ctpy::pymodule<"helpers", R"py(
+def h():
+    return 1
+)py">.name() == "helpers");
 
 } // namespace registry
 
@@ -380,18 +400,19 @@ static_assert(ctpy::pymodule<"helpers", "def h():\n    return 1\n">.name() == "h
 
 namespace modules {
 
-constexpr auto lib = ctpy::module<
-"def double(x):\n"
-"    return 2 * x\n"
-"def greet(name):\n"
-"    return 'hello ' + name\n"
-"def loud(xs):\n"
-"    return len(xs) * 10\n"
-"def noisy():\n"
-"    print('called')\n"
-"def boom():\n"
-"    return 1 // 0\n"
-"counter = 0\n">;
+constexpr auto lib = ctpy::module<R"py(
+def double(x):
+    return 2 * x
+def greet(name):
+    return 'hello ' + name
+def loud(xs):
+    return len(xs) * 10
+def noisy():
+    print('called')
+def boom():
+    return 1 // 0
+counter = 0
+)py">;
 
 // arguments lift like arg<> payloads; the return value is result()
 static_assert(lib.call<"double">(21).to<int>() == 42);
@@ -405,9 +426,10 @@ static_assert(lib.call<"noisy">().stdout() == "called\n");
 static_assert(lib.call<"double">(1)["counter"].to<int>() == 0);
 
 // a def returning a container comes back as a chaining view
-constexpr auto rows = ctpy::module<
-"def table(n):\n"
-"    return [[n, n * 2], 'done']\n">;
+constexpr auto rows = ctpy::module<R"py(
+def table(n):
+    return [[n, n * 2], 'done']
+)py">;
 static_assert(rows.call<"table">(3).result()[0][1].to<int>() == 6);
 static_assert(rows.call<"table">(3).result()[-1].str() == "done");
 
@@ -423,8 +445,11 @@ static_assert(lib.call<"double">(1, 2).exception().message()
 	== "double() takes 1 positional argument but 2 were given");
 
 // a module whose BODY raises reports it from any call
-static_assert(ctpy::module<"y = 1 // 0\ndef f():\n    return 1\n">.call<"f">().exception()
-	== ctpy::ZeroDivisionError);
+static_assert(ctpy::module<R"py(
+y = 1 // 0
+def f():
+    return 1
+)py">.call<"f">().exception() == ctpy::ZeroDivisionError);
 
 } // namespace modules
 

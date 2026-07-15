@@ -71,7 +71,12 @@ if/elif/else, while+break/continue+else, for over range/list/str/dict(+else);
 def (positional + default args, recursion with RecursionError guard at depth
 100, **no closures** — nested defs see globals + own locals only); return;
 builtins: print (sep/end), len, range, sum, min, max, abs, str, int, bool,
-sorted, enumerate, zip; f-strings (`{expr}`, `{{`/`}}`, no format specs);
+sorted, enumerate, zip; the str method set (ASCII semantics):
+split/rsplit/splitlines, join, strip/lstrip/rstrip, upper/lower/casefold/
+swapcase/capitalize/title, replace, find/rfind/index/rindex/count,
+startswith/endswith, isdigit/isalpha/isalnum/isspace/isupper/islower,
+zfill/ljust/rjust/center, removeprefix/removesuffix, partition/rpartition;
+f-strings (`{expr}`, `{{`/`}}`, no format specs);
 comments. **Deferred:** classes, generators, comprehensions, try/except,
 import execution, with, decorators, global/nonlocal, async.
 
@@ -512,6 +517,32 @@ manual `cp -R` + `diff -rq` in CLAUDE.md.
     CI stays hermetic); tests/parity.cpp static_asserts ok() +
     stdout()==CPython per case. Snippets avoid documented divergences
     (dict-view printing, 17-digit float reprs, set display order).
+
+- **str methods: DONE.** builtins.hpp grows the v0.1 str method set
+  (ASCII semantics), dispatched through the same Kind+name seam:
+  split/rsplit (whitespace mode incl. sep=None, explicit-sep empty
+  pieces, left/right-anchored maxsplit), splitlines (\n \r \r\n \v \f
+  \x1c-\x1e, no trailing empty), join (two-phase like f-strings:
+  materialize + type-check, then append - TypeError spells the item
+  slot), strip/lstrip/rstrip (chars argument is a SET; None = ASCII
+  whitespace), upper/lower/casefold(=lower)/swapcase/capitalize/title
+  (title tracks prev-cased, so 'a1a' -> 'A1A'), replace (empty old
+  inserts between chars and at both ends; count clamps from the left),
+  find/rfind (-1 on miss), index/rindex (ValueError), count
+  (non-overlapping; '' matches len+1), startswith/endswith,
+  isdigit/isalpha/isalnum/isspace/isupper/islower (empty -> False;
+  is-upper/lower need one cased char and all cased chars matching),
+  zfill (sign-aware), ljust/rjust/center (CPython's odd-margin
+  width-parity lean; fillchar validated before the width short-cut),
+  removeprefix/removesuffix, partition/rpartition (3-tuples; empty sep
+  is ValueError). Values and error spellings verified against CPython
+  3.14; tests/strmethods.cpp pins them. Substring results SHARE the
+  receiver's char run (str Objects are index ranges, immutable), and
+  identity results return self. Documented v0.1 deviations (soft
+  "ctpy v0.1" TypeErrors): no start/end slice forms on find/rfind/
+  index/rindex/count/startswith/endswith, no tuple form for
+  startswith/endswith, no keepends for splitlines, ASCII-only case/
+  space/boundary tables (U+0085 etc. are not line boundaries).
 
 ## Risks
 
