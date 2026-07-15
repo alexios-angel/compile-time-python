@@ -42,6 +42,17 @@ template <typename... Content> context(ctll::list<Content...>) -> context<ctll::
 // parse-time stack markers
 namespace mk {
 
+// The logical-line counter (M9 traceback threading). It is seeded at
+// the BOTTOM of the stack before the parse starts (parse.hpp) and
+// stays there: the grammar's @bump_line hook - placed after every
+// consumed NEWLINE marker, and only there - rewrites lc<N> to lc<N+1>,
+// so while any statement parses the counter reads the 0-based ordinal
+// of the logical line it started on. @end_stmt wraps each finished
+// simple statement in ast::lined<N, Stmt>; compound headers stash the
+// ordinal in their marker (ifm<N>/whilem<N>/form<N>/defm<N>/elifm<N>)
+// and hdr_folded wraps the whole statement when its suite closes.
+template <unsigned N> struct lc { };
+
 template <typename Op> struct bop { };                 // pending binary operator (left operand below)
 template <typename Op> struct uop { };                 // pending unary operator
 struct t_if { };                                       // ternary: then-part below, condition being parsed
@@ -60,19 +71,51 @@ template <typename NameText> struct kwmark { };        // name= (kwarg or param 
 template <typename Target> struct amark { };           // assignment: validated target below
 template <typename Op, typename Target> struct gmark { }; // augmented assignment
 struct retm { };                                       // return statement
-struct ifm { };                                        // if header
-struct elifm { };                                      // elif header (attachable if below)
+template <unsigned N> struct ifm { };                  // if header (N = its line ordinal)
+template <unsigned N> struct elifm { };                // elif header (attachable if below)
 struct elsem { };                                      // else header (attachable statement below)
-struct whilem { };                                     // while header
-struct form { };                                       // for header (targets follow)
-template <typename Target> struct inm { };             // for header: folded targets, iterable follows
-struct defm { };                                       // def statement
+template <unsigned N> struct whilem { };               // while header
+template <unsigned N> struct form { };                 // for header (targets follow)
+template <unsigned N, typename Target> struct inm { }; // for header: folded targets, iterable follows
+template <unsigned N> struct defm { };                 // def statement
 struct parm { };                                       // parameter list
 struct sm { };                                         // suite: statements accumulate above
 
 } // namespace mk
 
 namespace detail {
+
+// --- the logical-line counter ----------------------------------------
+
+// read the counter at the bottom of the stack (0 if it was never
+// seeded, e.g. hand-rolled parses in tests)
+template <typename L> struct cur_line_t {
+	static constexpr unsigned value = 0;
+};
+template <unsigned N> struct cur_line_t<ctll::list<mk::lc<N>>> {
+	static constexpr unsigned value = N;
+};
+template <typename H, typename... Ts>
+struct cur_line_t<ctll::list<H, Ts...>> : cur_line_t<ctll::list<Ts...>> { };
+template <typename L> inline constexpr unsigned cur_line = cur_line_t<L>::value;
+
+// rewrite lc<N> to lc<N+1> in place (identity when unseeded)
+template <typename L> struct bumped_t {
+	using type = L;
+};
+template <unsigned N> struct bumped_t<ctll::list<mk::lc<N>>> {
+	using type = ctll::list<mk::lc<N + 1>>;
+};
+template <typename H, typename... Ts> struct bumped_t<ctll::list<H, Ts...>> {
+	template <typename... Us> static constexpr auto prepend(ctll::list<Us...>) noexcept {
+		return ctll::list<H, Us...>{};
+	}
+	using type = decltype(prepend(typename bumped_t<ctll::list<Ts...>>::type{}));
+};
+
+template <typename T> struct is_lc_t : std::false_type { };
+template <unsigned N> struct is_lc_t<mk::lc<N>> : std::true_type { };
+template <typename T> inline constexpr bool is_lc = is_lc_t<T>::value;
 
 // --- classification -------------------------------------------------
 
@@ -127,6 +170,12 @@ template <typename T, typename I, typename B, typename E> struct is_stmt_t<ast::
 template <typename N, typename P, typename B> struct is_stmt_t<ast::def_stmt<N, P, B>> : std::true_type { };
 template <typename T> inline constexpr bool is_stmt = is_stmt_t<T>::value;
 
+// a statement already stamped with its line ordinal - the only form
+// suites and the module gather (every completed statement is wrapped)
+template <typename T> struct is_lined_t : std::false_type { };
+template <unsigned N, typename S> struct is_lined_t<ast::lined<N, S>> : is_stmt_t<S> { };
+template <typename T> inline constexpr bool is_lined_stmt = is_lined_t<T>::value;
+
 // statements allowed as an INLINE suite ("if x: y = 1")
 template <typename T> struct is_simple_stmt_t : std::false_type { };
 template <typename E> struct is_simple_stmt_t<ast::expr_stmt<E>> : std::true_type { };
@@ -136,6 +185,7 @@ template <> struct is_simple_stmt_t<ast::pass_stmt> : std::true_type { };
 template <> struct is_simple_stmt_t<ast::break_stmt> : std::true_type { };
 template <> struct is_simple_stmt_t<ast::continue_stmt> : std::true_type { };
 template <typename E> struct is_simple_stmt_t<ast::return_stmt<E>> : std::true_type { };
+template <unsigned N, typename S> struct is_simple_stmt_t<ast::lined<N, S>> : is_simple_stmt_t<S> { };
 template <typename T> inline constexpr bool is_simple_stmt = is_simple_stmt_t<T>::value;
 
 // valid assignment targets (recursively through tuple/list displays)
@@ -683,7 +733,7 @@ constexpr auto collect_targets(tpack<Tg...>, ctll::list<mk::amark<T>, Ts...>) no
 template <typename L> struct stmt_boundary : std::false_type { };
 template <> struct stmt_boundary<ctll::list<>> : std::true_type { };
 template <typename H, typename... Ts> struct stmt_boundary<ctll::list<H, Ts...>> {
-	static constexpr bool value = is_stmt<H> || std::is_same_v<H, mk::sm>;
+	static constexpr bool value = is_lined_stmt<H> || std::is_same_v<H, mk::sm> || is_lc<H>;
 };
 
 template <typename V, typename... Rs> constexpr auto end_fin(ctll::list<Rs...>) noexcept {
@@ -734,19 +784,32 @@ template <typename H, typename... Ts> struct head_stmt<ctll::list<H, Ts...>> {
 	static constexpr bool value = is_stmt<H>;
 };
 
+// stamp the just-finished statement on top with its line ordinal
+template <unsigned N, typename G> constexpr auto line_wrap(G) noexcept {
+	return ctll::reject{};
+}
+template <unsigned N, typename H, typename... Ts>
+constexpr auto line_wrap(ctll::list<H, Ts...>) noexcept {
+	if constexpr (is_stmt<H>) {
+		return ctll::list<ast::lined<N, H>, Ts...>{};
+	} else {
+		return ctll::reject{};
+	}
+}
+
 // --- for-loop targets ---------------------------------------------------
 
 template <typename G> constexpr auto for_in_impl2(G) noexcept {
 	return ctll::reject{};
 }
-template <typename... Es, bool Tr, typename... Ts>
-constexpr auto for_in_impl2(gathered<epack<Es...>, Tr, ctll::list<mk::form, Ts...>>) noexcept {
+template <typename... Es, bool Tr, unsigned N, typename... Ts>
+constexpr auto for_in_impl2(gathered<epack<Es...>, Tr, ctll::list<mk::form<N>, Ts...>>) noexcept {
 	if constexpr (sizeof...(Es) == 0 || !(is_name_node<Es> && ...)) {
 		return ctll::reject{};
 	} else if constexpr (sizeof...(Es) == 1 && !Tr) {
-		return ctll::list<mk::inm<typename first_of<Es...>::type>, Ts...>{};
+		return ctll::list<mk::inm<N, typename first_of<Es...>::type>, Ts...>{};
 	} else {
-		return ctll::list<mk::inm<ast::tuple_expr<Es...>>, Ts...>{};
+		return ctll::list<mk::inm<N, ast::tuple_expr<Es...>>, Ts...>{};
 	}
 }
 
@@ -762,55 +825,67 @@ template <typename... Acc, typename H, typename... Ts>
 constexpr auto gather_stmts(spack<Acc...>, ctll::list<H, Ts...>) noexcept {
 	if constexpr (std::is_same_v<H, mk::sm>) {
 		return stg<spack<Acc...>, ctll::list<Ts...>>{};
-	} else if constexpr (is_stmt<H>) {
+	} else if constexpr (is_lined_stmt<H>) {
 		return gather_stmts(spack<H, Acc...>{}, ctll::list<Ts...>{});
 	} else {
 		return ctll::reject{};
 	}
 }
 
-// attach a closed suite to the header below it
+// attach a closed suite to the header below it; the header marker
+// carries the line ordinal its keyword started on, so the finished
+// compound statement comes out already lined<> (an elif clause keeps
+// its OWN line inside the clause_pack)
 template <typename S, typename L> struct hdr_folded {
 	using type = ctll::reject;
 };
-template <typename S, typename T, typename... Rs> struct hdr_folded<S, ctll::list<T, mk::ifm, Rs...>> {
-	using type = std::conditional_t<is_expr<T>,
-	                                ctll::list<ast::if_stmt<T, S, ast::clause_pack<>, void>, Rs...>,
-	                                ctll::reject>;
-};
-template <typename S, typename T, typename IT, typename IB, typename... Cs, typename... Rs>
-struct hdr_folded<S, ctll::list<T, mk::elifm, ast::if_stmt<IT, IB, ast::clause_pack<Cs...>, void>, Rs...>> {
+template <typename S, typename T, unsigned N, typename... Rs>
+struct hdr_folded<S, ctll::list<T, mk::ifm<N>, Rs...>> {
 	using type = std::conditional_t<
 		is_expr<T>,
-		ctll::list<ast::if_stmt<IT, IB, ast::clause_pack<Cs..., ast::elif_clause<T, S>>, void>, Rs...>,
+		ctll::list<ast::lined<N, ast::if_stmt<T, S, ast::clause_pack<>, void>>, Rs...>,
 		ctll::reject>;
 };
-template <typename S, typename IT, typename IB, typename P, typename... Rs>
-struct hdr_folded<S, ctll::list<mk::elsem, ast::if_stmt<IT, IB, P, void>, Rs...>> {
-	using type = ctll::list<ast::if_stmt<IT, IB, P, S>, Rs...>;
+template <typename S, typename T, unsigned M, unsigned N, typename IT, typename IB, typename... Cs,
+          typename... Rs>
+struct hdr_folded<S, ctll::list<T, mk::elifm<M>,
+                                ast::lined<N, ast::if_stmt<IT, IB, ast::clause_pack<Cs...>, void>>,
+                                Rs...>> {
+	using type = std::conditional_t<
+		is_expr<T>,
+		ctll::list<ast::lined<N, ast::if_stmt<IT, IB,
+		                                      ast::clause_pack<Cs..., ast::lined<M, ast::elif_clause<T, S>>>,
+		                                      void>>,
+		           Rs...>,
+		ctll::reject>;
 };
-template <typename S, typename T, typename... Rs> struct hdr_folded<S, ctll::list<T, mk::whilem, Rs...>> {
+template <typename S, unsigned N, typename IT, typename IB, typename P, typename... Rs>
+struct hdr_folded<S, ctll::list<mk::elsem, ast::lined<N, ast::if_stmt<IT, IB, P, void>>, Rs...>> {
+	using type = ctll::list<ast::lined<N, ast::if_stmt<IT, IB, P, S>>, Rs...>;
+};
+template <typename S, typename T, unsigned N, typename... Rs>
+struct hdr_folded<S, ctll::list<T, mk::whilem<N>, Rs...>> {
 	using type = std::conditional_t<is_expr<T>,
-	                                ctll::list<ast::while_stmt<T, S, void>, Rs...>,
+	                                ctll::list<ast::lined<N, ast::while_stmt<T, S, void>>, Rs...>,
 	                                ctll::reject>;
 };
-template <typename S, typename WT, typename WB, typename... Rs>
-struct hdr_folded<S, ctll::list<mk::elsem, ast::while_stmt<WT, WB, void>, Rs...>> {
-	using type = ctll::list<ast::while_stmt<WT, WB, S>, Rs...>;
+template <typename S, unsigned N, typename WT, typename WB, typename... Rs>
+struct hdr_folded<S, ctll::list<mk::elsem, ast::lined<N, ast::while_stmt<WT, WB, void>>, Rs...>> {
+	using type = ctll::list<ast::lined<N, ast::while_stmt<WT, WB, S>>, Rs...>;
 };
-template <typename S, typename I, typename Tg, typename... Rs>
-struct hdr_folded<S, ctll::list<I, mk::inm<Tg>, Rs...>> {
+template <typename S, typename I, unsigned N, typename Tg, typename... Rs>
+struct hdr_folded<S, ctll::list<I, mk::inm<N, Tg>, Rs...>> {
 	using type = std::conditional_t<is_expr<I>,
-	                                ctll::list<ast::for_stmt<Tg, I, S, void>, Rs...>,
+	                                ctll::list<ast::lined<N, ast::for_stmt<Tg, I, S, void>>, Rs...>,
 	                                ctll::reject>;
 };
-template <typename S, typename Tg, typename I, typename B, typename... Rs>
-struct hdr_folded<S, ctll::list<mk::elsem, ast::for_stmt<Tg, I, B, void>, Rs...>> {
-	using type = ctll::list<ast::for_stmt<Tg, I, B, S>, Rs...>;
+template <typename S, unsigned N, typename Tg, typename I, typename B, typename... Rs>
+struct hdr_folded<S, ctll::list<mk::elsem, ast::lined<N, ast::for_stmt<Tg, I, B, void>>, Rs...>> {
+	using type = ctll::list<ast::lined<N, ast::for_stmt<Tg, I, B, S>>, Rs...>;
 };
-template <typename S, typename... Ps, typename N, typename... Rs>
-struct hdr_folded<S, ctll::list<ast::param_pack<Ps...>, ast::name<N>, mk::defm, Rs...>> {
-	using type = ctll::list<ast::def_stmt<N, ast::param_pack<Ps...>, S>, Rs...>;
+template <typename S, typename... Ps, unsigned Ln, typename N, typename... Rs>
+struct hdr_folded<S, ctll::list<ast::param_pack<Ps...>, ast::name<N>, mk::defm<Ln>, Rs...>> {
+	using type = ctll::list<ast::lined<Ln, ast::def_stmt<N, ast::param_pack<Ps...>, S>>, Rs...>;
 };
 
 template <bool Inline, typename G> constexpr auto close_suite_impl(G) noexcept {
@@ -832,9 +907,14 @@ constexpr auto close_suite_impl(stg<spack<Ss...>, ctll::list<Rs...>>) noexcept {
 template <typename... Acc> constexpr auto mod_gather(spack<Acc...>, ctll::list<>) noexcept {
 	return ctll::list<ast::module<Acc...>>{};
 }
+// the seeded line counter is the stack bottom; @end_module retires it
+template <typename... Acc, unsigned N>
+constexpr auto mod_gather(spack<Acc...>, ctll::list<mk::lc<N>>) noexcept {
+	return ctll::list<ast::module<Acc...>>{};
+}
 template <typename... Acc, typename H, typename... Ts>
 constexpr auto mod_gather(spack<Acc...>, ctll::list<H, Ts...>) noexcept {
-	if constexpr (is_stmt<H>) {
+	if constexpr (is_lined_stmt<H>) {
 		return mod_gather(spack<H, Acc...>{}, ctll::list<Ts...>{});
 	} else {
 		return ctll::reject{};
@@ -1128,14 +1208,23 @@ constexpr auto act(python_grammar::mk_aug, Tm, ctll::list<mk::bop<Op>, Ts...>) n
 	return aug_impl<Op>(gather_elems(fold_ready(ctll::list<Ts...>{})));
 }
 
-// simple statements
+// simple statements: fold, then stamp the statement with the ordinal
+// of the logical line it lives on (the counter has not bumped yet -
+// @bump_line follows @end_stmt in the grammar)
 template <typename Tm, typename... Ts>
 constexpr auto act(python_grammar::end_stmt, Tm, ctll::list<Ts...> s) noexcept {
+	constexpr unsigned at = cur_line<ctll::list<Ts...>>;
 	if constexpr (head_stmt<ctll::list<Ts...>>::value) {
-		return s; // break/continue/pass already folded themselves
+		return line_wrap<at>(s); // break/continue/pass already folded themselves
 	} else {
-		return end_stmt_impl(gather_elems(fold_ready(s)));
+		return line_wrap<at>(end_stmt_impl(gather_elems(fold_ready(s))));
 	}
+}
+
+// one logical line ended: advance the counter at the stack bottom
+template <typename Tm, typename... Ts>
+constexpr auto act(python_grammar::bump_line, Tm, ctll::list<Ts...>) noexcept {
+	return typename bumped_t<ctll::list<Ts...>>::type{};
 }
 template <typename Tm, auto... Cs, typename... Ts>
 constexpr auto act(python_grammar::kw_break, Tm, ctll::list<text<Cs...>, Ts...>) noexcept {
@@ -1154,38 +1243,41 @@ constexpr auto act(python_grammar::kw_return, Tm, ctll::list<text<Cs...>, Ts...>
 	return ctll::list<mk::retm, Ts...>{};
 }
 
-// compound statement headers
+// compound statement headers (each marker remembers the line ordinal
+// its keyword started on - the statement wraps in lined<> when its
+// suite closes, long after the counter has moved past the header)
 template <typename Tm, auto... Cs, typename... Ts>
 constexpr auto act(python_grammar::kw_if, Tm, ctll::list<text<Cs...>, Ts...>) noexcept {
-	return ctll::list<mk::ifm, Ts...>{};
+	return ctll::list<mk::ifm<cur_line<ctll::list<Ts...>>>, Ts...>{};
 }
-template <typename Tm, auto... Cs, typename T, typename B, typename P, typename... Ts>
+template <typename Tm, auto... Cs, unsigned N, typename T, typename B, typename P, typename... Ts>
 constexpr auto act(python_grammar::kw_elif, Tm,
-                   ctll::list<text<Cs...>, ast::if_stmt<T, B, P, void>, Ts...>) noexcept {
-	return ctll::list<mk::elifm, ast::if_stmt<T, B, P, void>, Ts...>{};
+                   ctll::list<text<Cs...>, ast::lined<N, ast::if_stmt<T, B, P, void>>, Ts...>) noexcept {
+	return ctll::list<mk::elifm<cur_line<ctll::list<Ts...>>>,
+	                  ast::lined<N, ast::if_stmt<T, B, P, void>>, Ts...>{};
 }
-template <typename Tm, auto... Cs, typename T, typename B, typename P, typename... Ts>
+template <typename Tm, auto... Cs, unsigned N, typename T, typename B, typename P, typename... Ts>
 constexpr auto act(python_grammar::kw_else, Tm,
-                   ctll::list<text<Cs...>, ast::if_stmt<T, B, P, void>, Ts...>) noexcept {
-	return ctll::list<mk::elsem, ast::if_stmt<T, B, P, void>, Ts...>{};
+                   ctll::list<text<Cs...>, ast::lined<N, ast::if_stmt<T, B, P, void>>, Ts...>) noexcept {
+	return ctll::list<mk::elsem, ast::lined<N, ast::if_stmt<T, B, P, void>>, Ts...>{};
 }
-template <typename Tm, auto... Cs, typename T, typename B, typename... Ts>
+template <typename Tm, auto... Cs, unsigned N, typename T, typename B, typename... Ts>
 constexpr auto act(python_grammar::kw_else, Tm,
-                   ctll::list<text<Cs...>, ast::while_stmt<T, B, void>, Ts...>) noexcept {
-	return ctll::list<mk::elsem, ast::while_stmt<T, B, void>, Ts...>{};
+                   ctll::list<text<Cs...>, ast::lined<N, ast::while_stmt<T, B, void>>, Ts...>) noexcept {
+	return ctll::list<mk::elsem, ast::lined<N, ast::while_stmt<T, B, void>>, Ts...>{};
 }
-template <typename Tm, auto... Cs, typename Tg, typename I, typename B, typename... Ts>
+template <typename Tm, auto... Cs, unsigned N, typename Tg, typename I, typename B, typename... Ts>
 constexpr auto act(python_grammar::kw_else, Tm,
-                   ctll::list<text<Cs...>, ast::for_stmt<Tg, I, B, void>, Ts...>) noexcept {
-	return ctll::list<mk::elsem, ast::for_stmt<Tg, I, B, void>, Ts...>{};
+                   ctll::list<text<Cs...>, ast::lined<N, ast::for_stmt<Tg, I, B, void>>, Ts...>) noexcept {
+	return ctll::list<mk::elsem, ast::lined<N, ast::for_stmt<Tg, I, B, void>>, Ts...>{};
 }
 template <typename Tm, auto... Cs, typename... Ts>
 constexpr auto act(python_grammar::kw_while, Tm, ctll::list<text<Cs...>, Ts...>) noexcept {
-	return ctll::list<mk::whilem, Ts...>{};
+	return ctll::list<mk::whilem<cur_line<ctll::list<Ts...>>>, Ts...>{};
 }
 template <typename Tm, auto... Cs, typename... Ts>
 constexpr auto act(python_grammar::kw_for, Tm, ctll::list<text<Cs...>, Ts...>) noexcept {
-	return ctll::list<mk::form, Ts...>{};
+	return ctll::list<mk::form<cur_line<ctll::list<Ts...>>>, Ts...>{};
 }
 template <typename Tm, auto... Cs, typename... Ts>
 constexpr auto act(python_grammar::for_in, Tm, ctll::list<text<Cs...>, Ts...>) noexcept {
@@ -1197,7 +1289,7 @@ constexpr auto act(python_grammar::for_in, Tm, ctll::list<Ts...> s) noexcept {
 }
 template <typename Tm, auto... Cs, typename... Ts>
 constexpr auto act(python_grammar::kw_def, Tm, ctll::list<text<Cs...>, Ts...>) noexcept {
-	return ctll::list<mk::defm, Ts...>{};
+	return ctll::list<mk::defm<cur_line<ctll::list<Ts...>>>, Ts...>{};
 }
 template <typename Tm, typename... Ts>
 constexpr auto act(python_grammar::open_params, Tm, ctll::list<Ts...>) noexcept {

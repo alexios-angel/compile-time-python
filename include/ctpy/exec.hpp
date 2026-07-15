@@ -72,6 +72,20 @@ template <typename Stmt, typename St> constexpr Flow exec_node(St & st) {
 	return executor<Stmt>::run(st);
 }
 
+// the traceback threading (M9): every statement in a parsed suite is
+// wrapped in ast::lined<N, S> (N = logical-line ordinal); executing one
+// stamps State::current_line through the pre-lexer's line table before
+// running the statement, so any raise inside it carries its line.
+// Loop headers re-stamp per iteration (their executors save the line
+// at entry), matching CPython: a raising `while` TEST reports the
+// while line, not the last body statement's.
+template <unsigned N, typename S> struct executor<ast::lined<N, S>> {
+	template <typename St> static constexpr Flow run(St & st) {
+		st.current_line = st.line_at(N);
+		return executor<S>::run(st);
+	}
+};
+
 // --- assignment targets ------------------------------------------------------
 
 // no specialization = the target kind is not assignable (attribute
@@ -299,15 +313,18 @@ template <typename Else, typename St> constexpr Flow exec_else(St & st) {
 	}
 }
 
+// each elif clause carries its own line (lined<> inside the pack): the
+// clause's test raises with the elif's line, like a CPython traceback
 template <typename Clauses, typename Else> struct elif_chain;
 template <typename Else> struct elif_chain<ast::clause_pack<>, Else> {
 	template <typename St> static constexpr Flow run(St & st) {
 		return exec_else<Else>(st);
 	}
 };
-template <typename Test, typename Body, typename... Rest, typename Else>
-struct elif_chain<ast::clause_pack<ast::elif_clause<Test, Body>, Rest...>, Else> {
+template <unsigned N, typename Test, typename Body, typename... Rest, typename Else>
+struct elif_chain<ast::clause_pack<ast::lined<N, ast::elif_clause<Test, Body>>, Rest...>, Else> {
 	template <typename St> static constexpr Flow run(St & st) {
+		st.current_line = st.line_at(N);
 		const std::uint32_t condition = eval_node<Test, St>(st);
 		if (st.raised) {
 			return Flow::next;
@@ -336,7 +353,9 @@ struct executor<ast::if_stmt<Test, Body, Elifs, Else>> {
 template <typename Test, typename Body, typename Else>
 struct executor<ast::while_stmt<Test, Body, Else>> {
 	template <typename St> static constexpr Flow run(St & st) {
+		const int header_line = st.current_line; // re-stamped per test eval
 		while (true) {
+			st.current_line = header_line;
 			const std::uint32_t condition = eval_node<Test, St>(st);
 			if (st.raised) {
 				return Flow::next;
@@ -373,8 +392,10 @@ struct executor<ast::for_stmt<Target, Iter, Body, Else>> {
 				{"'", type_name(sequence.kind), "' object is not iterable"});
 			return Flow::next;
 		}
+		const int header_line = st.current_line; // the target rebinds on the for line
 		const long long limit = iter_len(st, sequence);
 		for (long long at = 0; at < limit; ++at) {
+			st.current_line = header_line;
 			const std::uint32_t element = iter_get(st, sequence, at);
 			assign_target<Target>::run(st, element);
 			if (st.raised) {

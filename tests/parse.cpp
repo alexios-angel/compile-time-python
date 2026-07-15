@@ -239,59 +239,65 @@ namespace ast = ctpy::ast;
 using ctpy::text;
 template <ctll::fixed_string Src> using parsed = ctpy::detail::parsed_module<Src>;
 
+// every statement comes out stamped with its 0-based LOGICAL line
+// ordinal (ast::lined<N, Stmt> - the M9 traceback threading)
+
 // x = 1
 static_assert(std::is_same_v<
 	parsed<"x = 1">,
-	ast::module<ast::assign_stmt<ast::int_lit<text<'1'>>, ast::name<text<'x'>>>>>);
+	ast::module<ast::lined<0,
+		ast::assign_stmt<ast::int_lit<text<'1'>>, ast::name<text<'x'>>>>>>);
 
 // x + y*2 : mul binds tighter than add
 static_assert(std::is_same_v<
 	parsed<"x + y*2">,
-	ast::module<ast::expr_stmt<
+	ast::module<ast::lined<0, ast::expr_stmt<
 		ast::binary_expr<ast::op_add,
 		                 ast::name<text<'x'>>,
 		                 ast::binary_expr<ast::op_mul,
 		                                  ast::name<text<'y'>>,
-		                                  ast::int_lit<text<'2'>>>>>>>);
+		                                  ast::int_lit<text<'2'>>>>>>>>);
 
-// a small if/else
+// a small if/else (the if is line 0, its body line 1, the else-body
+// line 3 - the else header line itself holds no statement)
 static_assert(std::is_same_v<
 	parsed<"if x:\n    y = 1\nelse:\n    y = 2\n">,
-	ast::module<ast::if_stmt<
+	ast::module<ast::lined<0, ast::if_stmt<
 		ast::name<text<'x'>>,
-		ast::suite<ast::assign_stmt<ast::int_lit<text<'1'>>, ast::name<text<'y'>>>>,
+		ast::suite<ast::lined<1, ast::assign_stmt<ast::int_lit<text<'1'>>, ast::name<text<'y'>>>>>,
 		ast::clause_pack<>,
-		ast::suite<ast::assign_stmt<ast::int_lit<text<'2'>>, ast::name<text<'y'>>>>>>>);
+		ast::suite<ast::lined<3, ast::assign_stmt<ast::int_lit<text<'2'>>, ast::name<text<'y'>>>>>>>>>);
 
 // a def with one parameter
 static_assert(std::is_same_v<
 	parsed<"def f(n):\n    return n\n">,
-	ast::module<ast::def_stmt<
+	ast::module<ast::lined<0, ast::def_stmt<
 		text<'f'>,
 		ast::param_pack<ast::param<text<'n'>, void>>,
-		ast::suite<ast::return_stmt<ast::name<text<'n'>>>>>>>);
+		ast::suite<ast::lined<1, ast::return_stmt<ast::name<text<'n'>>>>>>>>>);
 
 // an f-string survives as a raw atom
 static_assert(std::is_same_v<
 	parsed<"x = f'hi'">,
-	ast::module<ast::assign_stmt<ast::fstr_lit<text<'h', 'i'>>, ast::name<text<'x'>>>>>);
+	ast::module<ast::lined<0,
+		ast::assign_stmt<ast::fstr_lit<text<'h', 'i'>>, ast::name<text<'x'>>>>>>);
 
 // chained comparison folds into one compare node
 static_assert(std::is_same_v<
 	parsed<"1 < x < 10">,
-	ast::module<ast::expr_stmt<ast::compare_expr<
+	ast::module<ast::lined<0, ast::expr_stmt<ast::compare_expr<
 		ast::int_lit<text<'1'>>,
 		ast::cmp_link<ast::op_lt, ast::name<text<'x'>>>,
-		ast::cmp_link<ast::op_lt, ast::int_lit<text<'1', '0'>>>>>>>);
+		ast::cmp_link<ast::op_lt, ast::int_lit<text<'1', '0'>>>>>>>>);
 
 // power is right-associative and folds under unary minus
 static_assert(std::is_same_v<
 	parsed<"-2 ** 3 ** 2">,
-	ast::module<ast::expr_stmt<ast::unary_expr<ast::op_neg,
+	ast::module<ast::lined<0, ast::expr_stmt<ast::unary_expr<ast::op_neg,
 		ast::binary_expr<ast::op_pow,
 		                 ast::int_lit<text<'2'>>,
 		                 ast::binary_expr<ast::op_pow,
 		                                  ast::int_lit<text<'3'>>,
-		                                  ast::int_lit<text<'2'>>>>>>>>);
+		                                  ast::int_lit<text<'2'>>>>>>>>>);
 
 int main() { }

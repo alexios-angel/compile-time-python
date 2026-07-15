@@ -569,8 +569,7 @@ template <typename St> constexpr std::uint32_t bin_op(St & st, bop op, std::uint
 			if (both_num) {
 				const double denominator = to_double(rhs);
 				if (denominator == 0.0) {
-					return st.raise_error(ex_kind::ZeroDivisionError,
-						both_int ? "division by zero" : "float division by zero");
+					return st.raise_error(ex_kind::ZeroDivisionError, "division by zero");
 				}
 				return st.make_float(to_double(lhs) / denominator);
 			}
@@ -578,14 +577,14 @@ template <typename St> constexpr std::uint32_t bin_op(St & st, bop op, std::uint
 		case bop::floordiv:
 			if (both_int) {
 				if (rhs.i == 0) {
-					return st.raise_error(ex_kind::ZeroDivisionError, "integer division or modulo by zero");
+					return st.raise_error(ex_kind::ZeroDivisionError, "division by zero");
 				}
 				return st.make_int(floordiv_ll(lhs.i, rhs.i));
 			}
 			if (both_num) {
 				const double denominator = to_double(rhs);
 				if (denominator == 0.0) {
-					return st.raise_error(ex_kind::ZeroDivisionError, "float floor division by zero");
+					return st.raise_error(ex_kind::ZeroDivisionError, "division by zero");
 				}
 				return st.make_float(floor_d(to_double(lhs) / denominator));
 			}
@@ -593,14 +592,14 @@ template <typename St> constexpr std::uint32_t bin_op(St & st, bop op, std::uint
 		case bop::mod:
 			if (both_int) {
 				if (rhs.i == 0) {
-					return st.raise_error(ex_kind::ZeroDivisionError, "integer division or modulo by zero");
+					return st.raise_error(ex_kind::ZeroDivisionError, "division by zero");
 				}
 				return st.make_int(mod_ll(lhs.i, rhs.i));
 			}
 			if (both_num) {
 				const double denominator = to_double(rhs);
 				if (denominator == 0.0) {
-					return st.raise_error(ex_kind::ZeroDivisionError, "float modulo");
+					return st.raise_error(ex_kind::ZeroDivisionError, "division by zero");
 				}
 				return st.make_float(mod_d(to_double(lhs), denominator));
 			}
@@ -623,14 +622,14 @@ template <typename St> constexpr std::uint32_t bin_op(St & st, bop op, std::uint
 					}
 					if (lhs.i == 0) {
 						return st.raise_error(ex_kind::ZeroDivisionError,
-							"0.0 cannot be raised to a negative power");
+							"zero to a negative power");
 					}
 					return st.make_float(ipow_d(static_cast<double>(lhs.i), exp));
 				}
 				const double base = to_double(lhs);
 				if (base == 0.0 && exp < 0) {
 					return st.raise_error(ex_kind::ZeroDivisionError,
-						"0.0 cannot be raised to a negative power");
+						"zero to a negative power");
 				}
 				return st.make_float(ipow_d(base, exp));
 			}
@@ -1337,7 +1336,7 @@ template <typename M> struct single_expr {
 	static_assert(sizeof(M) == 0,
 		"ctpy::eval<Src> evaluates a single EXPRESSION; statements need ctpy::run<Src>");
 };
-template <typename E> struct single_expr<ast::module<ast::expr_stmt<E>>> {
+template <unsigned N, typename E> struct single_expr<ast::module<ast::lined<N, ast::expr_stmt<E>>>> {
 	using type = E;
 };
 

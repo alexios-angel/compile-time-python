@@ -215,8 +215,7 @@ inline constexpr stdin_t<Text> stdin_text{};
 // source parses (a parse-demanding entry point, family policy), but
 // `import` execution is deferred, so the seed records nothing yet.
 CTPY_EXPORT template <ctll::fixed_string Name, ctll::fixed_string Src> struct pymodule_t {
-	static_assert(is_valid<Src>,
-		"ctpy::pymodule<Name, Src>: the module source failed to pre-lex or parse");
+	static_assert(detail::require_valid<Src>()); // hard-errors NAMING the stage
 
 	static constexpr std::string_view name() noexcept {
 		return detail::narrow_view<Name>;
@@ -304,10 +303,12 @@ namespace detail {
 
 template <ctll::fixed_string Src, ctll::fixed_string Fn, typename ArenaT, typename... A>
 constexpr auto call_to_flat(const A &... args) {
-	static_assert(is_valid<Src>,
-		"ctpy::module<Src>: the source failed to pre-lex or parse (soft-check with ctpy::is_valid<Src>)");
+	static_assert(require_valid<Src>()); // hard-errors NAMING the stage
 	State<ArenaT> st{};
+	st.line_map = prelex_raw<Src>.lines.data();
+	st.line_map_count = static_cast<std::uint32_t>(prelex_raw<Src>.lines.size());
 	(void)exec_node<parsed_module<Src>, State<ArenaT>>(st);
+	st.current_line = 0; // the .call<> dispatch has no Python call site
 	std::uint32_t result = not_found;
 	if (!st.raised) {
 		const std::uint32_t bound = st.lookup(narrow_view<Fn>);
@@ -340,8 +341,7 @@ constexpr auto call_to_flat(const A &... args) {
 // the result() channel (to<T>()/str() forward to it), stdout and any
 // exception come along like a run<>.
 CTPY_EXPORT template <ctll::fixed_string Src, typename ArenaT = Arena<>> struct module_t {
-	static_assert(is_valid<Src>,
-		"ctpy::module<Src>: the source failed to pre-lex or parse (soft-check with ctpy::is_valid<Src>)");
+	static_assert(detail::require_valid<Src>()); // hard-errors NAMING the stage
 
 	template <ctll::fixed_string Fn, typename... A>
 	constexpr auto call(const A &... args) const noexcept {

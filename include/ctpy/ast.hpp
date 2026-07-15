@@ -92,6 +92,23 @@ template <typename Obj, typename NameText> struct attribute_expr { };
 
 // --- statements
 
+// The traceback line threading (M9). Every statement that lands in a
+// suite / module / clause_pack is wrapped in lined<N, Stmt>, where N is
+// the 0-based LOGICAL line ordinal the statement STARTED on (an elif
+// clause is wrapped the same way - its test has its own line). The
+// ordinal is counted by the parse actions from the pre-lexer's NEWLINE
+// markers (a type-level counter at the bottom of the parse stack,
+// bumped by the grammar's @bump_line hooks), and the interpreter
+// resolves it to a 1-based physical source line through the pre-lexer's
+// logical-line table (prelex_result::lines) - so a statement continued
+// across physical lines (backslash, brackets) reports the line it
+// started on, exactly like a CPython traceback. Executing lined<N, S>
+// stamps State::current_line before running S; raise_error copies it
+// into PyError::line. Granularity is deliberately per-STATEMENT: an
+// expression inside a multi-line statement reports the statement's
+// first line (documented v0.1 deviation).
+template <unsigned N, typename S> struct lined { };
+
 template <typename E> struct expr_stmt { };
 // x = y = V  ==  assign_stmt<V, x, y>  (targets in source order)
 template <typename V, typename... Targets> struct assign_stmt { };

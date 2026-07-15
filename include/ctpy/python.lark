@@ -142,16 +142,19 @@ statement: "b" @begin_text @push_char ks_b1
          | "+" @op_pos ws opnd stmt_tail
          | "~" @op_inv ws opnd stmt_tail
 
-stmt_tail: sloop NEWL @end_stmt
+// @end_stmt folds the finished statement and wraps it with the current
+// logical-line ordinal; @bump_line then advances the type-level line
+// counter (it sits after EVERY consumed NEWL, and only there)
+stmt_tail: sloop NEWL @end_stmt @bump_line
 
 // the no-boundary variant, entered right after an identifier or
 // keyword-literal atom ended a chain: an adjacent name character was
 // consumed by maximal munch, so a keyword operator (or/and/...) here
 // needs at least one space first - one SP unlocks the full sloop
-stmt_tail_nb: sloop_nb NEWL @end_stmt
+stmt_tail_nb: sloop_nb NEWL @end_stmt @bump_line
 
 line_end: SP line_end
-        | NEWL @end_stmt
+        | NEWL @end_stmt @bump_line
 
 // shared identifier tail: gobble name characters, fold at the boundary
 // (@mk_name rejects reserved words used as plain names)
@@ -295,10 +298,10 @@ ks_r6: NAMECHAR @push_char name_tail stmt_tail
      | @kw_return ret_val
 
 ret_val: SP ret_ws
-       | NEWL @end_stmt
+       | NEWL @end_stmt @bump_line
        | opnd_sym stmt_tail
 ret_ws: SP ret_ws
-      | NEWL @end_stmt
+      | NEWL @end_stmt @bump_line
       | opnd stmt_tail
 
 // while
@@ -375,7 +378,7 @@ colon_suite: ws ":" @begin_suite suite
 // a suite is either inline (one simple statement on the same line) or
 // a NEWLINE INDENT block DEDENT
 suite: SP suite
-     | NEWL suite_block
+     | NEWL @bump_line suite_block
      | statement @close_inline
 
 suite_block: INDENT stmt_list DEDENT @close_block

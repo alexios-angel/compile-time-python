@@ -42,6 +42,10 @@ RecursionError guard at depth 100)
 → `result.hpp`/`views.hpp` (right-size via ctc::shrunk into per-Src static
 storage; uniform ctpy::value null-object views, ctjson views.hpp analog)
 → `bind.hpp` (arg<>/file<>/stdin_text<>/pymodule<>/lift<>).
+Diagnostics: `diag.hpp` (`error_info<src>()` stage/kind/line/column,
+`error_message<src>()` caret render); tracebacks ride `ast::lined<N,Stmt>`
+line stamps (prelex lines table -> @bump_line counter -> exec stamps
+`State::current_line` -> `PyError::line`).
 
 ## Gotchas (load-bearing)
 - **Vendored, never edit here:** `include/ctll` (source of truth

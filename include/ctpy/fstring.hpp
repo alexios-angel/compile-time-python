@@ -186,7 +186,8 @@ template <typename M> struct fstring_hole_expr {
 	static_assert(sizeof(M) == 0,
 		"ctpy f-string: a {...} hole must hold a single expression (statements are not allowed)");
 };
-template <typename E> struct fstring_hole_expr<ast::module<ast::expr_stmt<E>>> {
+template <unsigned N, typename E>
+struct fstring_hole_expr<ast::module<ast::lined<N, ast::expr_stmt<E>>>> {
 	using type = E;
 };
 

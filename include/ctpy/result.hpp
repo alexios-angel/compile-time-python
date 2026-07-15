@@ -278,9 +278,10 @@ constexpr run_result<Caps> flatten(const StateT & st, std::uint32_t result_index
 // bind left to right, then the module body runs
 template <ctll::fixed_string Src, typename ArenaT, typename... Seeds>
 constexpr auto run_to_flat(const Seeds &... seeds) {
-	static_assert(is_valid<Src>,
-		"ctpy::run<Src>: the source failed to pre-lex or parse (soft-check with ctpy::is_valid<Src>)");
+	static_assert(require_valid<Src>()); // hard-errors NAMING the stage
 	State<ArenaT> st{};
+	st.line_map = prelex_raw<Src>.lines.data();
+	st.line_map_count = static_cast<std::uint32_t>(prelex_raw<Src>.lines.size());
 	(seeds.seed(st), ...);
 	(void)exec_node<parsed_module<Src>, State<ArenaT>>(st);
 	return flatten<flat_caps<ArenaT>>(st, not_found);
@@ -288,10 +289,12 @@ constexpr auto run_to_flat(const Seeds &... seeds) {
 
 template <ctll::fixed_string Src, typename ArenaT>
 constexpr auto eval_to_flat() {
-	static_assert(is_valid<Src>,
-		"ctpy::eval<Src>: the source failed to pre-lex or parse (soft-check with ctpy::is_valid<Src>)");
+	static_assert(require_valid<Src>()); // hard-errors NAMING the stage
 	using Expr = typename single_expr<parsed_module<Src>>::type;
 	State<ArenaT> st{};
+	st.line_map = prelex_raw<Src>.lines.data();
+	st.line_map_count = static_cast<std::uint32_t>(prelex_raw<Src>.lines.size());
+	st.current_line = st.line_at(0); // the whole source is one expression
 	const std::uint32_t result = eval_node<Expr, State<ArenaT>>(st);
 	return flatten<flat_caps<ArenaT>>(st, st.raised ? not_found : result);
 }

@@ -220,6 +220,7 @@ struct python_grammar {
 	struct begin_str: ctll::action {};
 	struct begin_suite: ctll::action {};
 	struct begin_text: ctll::action {};
+	struct bump_line: ctll::action {};
 	struct close_block: ctll::action {};
 	struct close_brace: ctll::action {};
 	struct close_call: ctll::action {};
@@ -421,12 +422,12 @@ struct python_grammar {
 	static constexpr auto rule(statement, plus) -> ctll::push<ctll::anything, op_pos, ws, opnd, stmt_tail>;
 	static constexpr auto rule(statement, tilde) -> ctll::push<ctll::anything, op_inv, ws, opnd, stmt_tail>;
 
-	static constexpr auto rule(stmt_tail, set_4) -> ctll::push<sloop, NEWL, end_stmt>;
+	static constexpr auto rule(stmt_tail, set_4) -> ctll::push<sloop, NEWL, end_stmt, bump_line>;
 
-	static constexpr auto rule(stmt_tail_nb, set_5) -> ctll::push<sloop_nb, NEWL, end_stmt>;
+	static constexpr auto rule(stmt_tail_nb, set_5) -> ctll::push<sloop_nb, NEWL, end_stmt, bump_line>;
 
 	static constexpr auto rule(line_end, SP) -> ctll::push<ctll::anything, line_end>;
-	static constexpr auto rule(line_end, NEWL) -> ctll::push<ctll::anything, end_stmt>;
+	static constexpr auto rule(line_end, NEWL) -> ctll::push<ctll::anything, end_stmt, bump_line>;
 
 	static constexpr auto rule(name_tail, NAMECHAR) -> ctll::push<ctll::anything, push_char, name_tail>;
 	static constexpr auto rule(name_tail, set_6) -> ctll::push<mk_name>;
@@ -585,11 +586,11 @@ struct python_grammar {
 	static constexpr auto rule(ks_r6, set_8) -> ctll::push<kw_return, ret_val>;
 
 	static constexpr auto rule(ret_val, SP) -> ctll::push<ctll::anything, ret_ws>;
-	static constexpr auto rule(ret_val, NEWL) -> ctll::push<ctll::anything, end_stmt>;
+	static constexpr auto rule(ret_val, NEWL) -> ctll::push<ctll::anything, end_stmt, bump_line>;
 	static constexpr auto rule(ret_val, doublequote__quote__open__plus__minus__sopen__copen__tilde) -> ctll::push<opnd_sym, stmt_tail>;
 
 	static constexpr auto rule(ret_ws, SP) -> ctll::push<ctll::anything, ret_ws>;
-	static constexpr auto rule(ret_ws, NEWL) -> ctll::push<ctll::anything, end_stmt>;
+	static constexpr auto rule(ret_ws, NEWL) -> ctll::push<ctll::anything, end_stmt, bump_line>;
 	static constexpr auto rule(ret_ws, set_2) -> ctll::push<opnd, stmt_tail>;
 
 	static constexpr auto rule(ks_w1, h) -> ctll::push<ctll::anything, push_char, ks_w2>;
@@ -665,7 +666,7 @@ struct python_grammar {
 	static constexpr auto rule(colon_suite, SP__colon) -> ctll::push<ws, colon, begin_suite, suite>;
 
 	static constexpr auto rule(suite, SP) -> ctll::push<ctll::anything, suite>;
-	static constexpr auto rule(suite, NEWL) -> ctll::push<ctll::anything, suite_block>;
+	static constexpr auto rule(suite, NEWL) -> ctll::push<ctll::anything, bump_line, suite_block>;
 	static constexpr auto rule(suite, set_2) -> ctll::push<statement, close_inline>;
 
 	static constexpr auto rule(suite_block, INDENT) -> ctll::push<ctll::anything, stmt_list, DEDENT, close_block>;

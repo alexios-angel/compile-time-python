@@ -7,6 +7,7 @@
 
 #ifndef CTPY_IN_A_MODULE
 #include <cstddef>
+#include <cstdint>
 #endif
 
 // The pre-lexer. Python's grammar is context-free only after a stateful
@@ -78,17 +79,34 @@ CTPY_EXPORT constexpr const char * to_string(prelex_error_kind k) noexcept {
 	return "unknown";
 }
 
-// the queryable error state: what failed and on which 1-based source
-// line (line 0 when nothing failed)
+// the queryable error state: what failed, on which 1-based source line,
+// and at which byte offset into the RAW source (line 0 / offset 0 when
+// nothing failed; diag.hpp turns the offset into line/column + caret)
 CTPY_EXPORT struct prelex_status {
 	prelex_error_kind kind = prelex_error_kind::none;
 	size_t line = 0;
+	size_t offset = 0;
 };
 
-// what the oversized pass produces: the marker stream so far plus the
-// status (on failure the text is the partial rewrite, for debugging)
+// What the oversized pass produces: the marker stream so far plus the
+// status (on failure the text is the partial rewrite, for debugging),
+// and two side tables the diagnostics/traceback machinery reads:
+//
+//   src_map[k]  the RAW-source byte offset that produced text[k] (for
+//               synthesized markers: the offset they stand for), so a
+//               parse failure at marker position k maps back to a
+//               caret position in the original script;
+//   lines[k]    the 1-based PHYSICAL source line on which LOGICAL line
+//               k started - the traceback side of the line threading:
+//               the parse actions stamp each statement with its logical
+//               line ordinal (ast::lined<N, Stmt>), and the interpreter
+//               resolves ordinals through this table, so statements
+//               continued across physical lines (backslash, brackets)
+//               report the line they started on, like CPython.
 CTPY_EXPORT template <size_t N> struct prelex_result {
 	ctc::string<N> text{};
+	ctc::vector<std::uint32_t, N> src_map{};
+	ctc::vector<std::uint32_t, N / 2 + 2> lines{};
 	prelex_status status{};
 
 	constexpr bool ok() const noexcept {
@@ -114,12 +132,19 @@ template <size_t Cap> struct prelexer {
 	constexpr bool failed() const noexcept {
 		return out.status.kind != prelex_error_kind::none;
 	}
-	constexpr void fail(prelex_error_kind kind, size_t at) noexcept {
+	constexpr void fail(prelex_error_kind kind, size_t at_line, size_t at_offset) noexcept {
 		out.status.kind = kind;
-		out.status.line = at;
+		out.status.line = at_line;
+		out.status.offset = at_offset;
+	}
+	// emit one output unit, remembering which source offset produced it
+	// (synthesized markers pass the offset they stand for)
+	constexpr void put_at(char c, size_t from) noexcept {
+		out.text.push_back(c);
+		out.src_map.push_back(static_cast<std::uint32_t>(from));
 	}
 	constexpr void put(char c) noexcept {
-		out.text.push_back(c);
+		put_at(c, i);
 	}
 
 	// measure the indentation of the physical line starting at `i` and
@@ -155,7 +180,7 @@ template <size_t Cap> struct prelexer {
 		}
 		if (col > indents[sp - 1]) {
 			if (sp == prelex_max_indent) {
-				fail(prelex_error_kind::too_deep, line);
+				fail(prelex_error_kind::too_deep, line, i);
 				return false;
 			}
 			indents[sp] = col;
@@ -167,7 +192,7 @@ template <size_t Cap> struct prelexer {
 				put(dedent_marker);
 			}
 			if (col != indents[sp - 1]) {
-				fail(prelex_error_kind::inconsistent_dedent, line);
+				fail(prelex_error_kind::inconsistent_dedent, line, i);
 				return false;
 			}
 		}
@@ -181,6 +206,7 @@ template <size_t Cap> struct prelexer {
 	constexpr void scan_string() noexcept {
 		const char quote = in[i];
 		const size_t start_line = line;
+		const size_t start_at = i; // the opening quote, for the error caret
 		put(quote);
 		++i;
 		bool triple = false;
@@ -206,7 +232,7 @@ template <size_t Cap> struct prelexer {
 			}
 			if (c == '\n') {
 				if (!triple) {
-					fail(prelex_error_kind::unterminated_string, start_line);
+					fail(prelex_error_kind::unterminated_string, start_line, start_at);
 					return;
 				}
 				++line; // triple-quoted: real newlines stay in
@@ -234,7 +260,7 @@ template <size_t Cap> struct prelexer {
 			put(c);
 			++i;
 		}
-		fail(prelex_error_kind::unterminated_string, start_line);
+		fail(prelex_error_kind::unterminated_string, start_line, start_at);
 	}
 
 	// copy the rest of the logical line (which can span physical lines
@@ -247,22 +273,22 @@ template <size_t Cap> struct prelexer {
 				++line;
 				++i;
 				if (depth > 0) { // implicit continuation inside ( [ {
-					put(' ');
+					put_at(' ', i - 1);
 					continue;
 				}
-				put(newline_marker);
+				put_at(newline_marker, i - 1);
 				return;
 			}
 			if (c == '\\' && i + 1 < n && in[i + 1] == '\n') { // explicit join
 				++line;
 				i += 2;
-				put(' ');
+				put_at(' ', i - 2);
 				continue;
 			}
 			if (c == '\\' && i + 2 < n && in[i + 1] == '\r' && in[i + 2] == '\n') {
 				++line;
 				i += 3;
-				put(' ');
+				put_at(' ', i - 3);
 				continue;
 			}
 			if (c == '#') { // comment: gone to end of physical line
@@ -298,6 +324,8 @@ template <size_t Cap> struct prelexer {
 			if (!handle_indentation()) {
 				continue;
 			}
+			// a new LOGICAL line starts here: remember its physical line
+			out.lines.push_back(static_cast<std::uint32_t>(line));
 			scan_line();
 		}
 		if (failed()) {

@@ -231,8 +231,10 @@ CTPY_EXPORT inline constexpr ex_kind EOFError = ex_kind::EOFError;
 CTPY_EXPORT inline constexpr ex_kind TabError = ex_kind::TabError;
 CTPY_EXPORT inline constexpr ex_kind SyntaxError = ex_kind::SyntaxError;
 
-// the raised exception: type, message, source line (0 until the M9
-// diagnostics pass threads line numbers through). The message is a
+// the raised exception: type, message, and the 1-based source line of
+// the statement that raised (0 when no line information was threaded,
+// e.g. raw exec<>/eval<> over a State without a line map - the public
+// run/eval/call entry points always thread it). The message is a
 // fixed-capacity copy that TRUNCATES rather than overflow - an error
 // message must never itself fail the build.
 CTPY_EXPORT struct PyError {
@@ -303,7 +305,22 @@ CTPY_EXPORT template <typename ArenaT = Arena<>> struct State {
 	int recursion_limit = 100;              // RecursionError fires here, far below -fconstexpr-depth
 	ctc::vector<vfs_entry, 16> vfs{};       // mounted ctpy::file<> descriptors, seeded before exec
 	std::string_view stdin_content{};       // mounted ctpy::stdin_text<>; input() reads lines
+
+	// the traceback line threading (M9): the pre-lexer's logical-line
+	// table (ordinal -> 1-based physical line; points into the per-Src
+	// static prelex_raw storage, seeded by result.hpp/bind.hpp), and the
+	// line of the statement currently executing (exec of ast::lined<N,S>
+	// stamps it; raise_error copies it into the PyError)
+	const std::uint32_t * line_map = nullptr;
+	std::uint32_t line_map_count = 0;
+	int current_line = 0;
+
 	std::size_t stdin_at = 0;               // input()'s cursor into stdin_content
+
+	// resolve a logical-line ordinal to its physical source line
+	constexpr int line_at(unsigned ordinal) const noexcept {
+		return ordinal < line_map_count ? static_cast<int>(line_map[ordinal]) : 0;
+	}
 
 	constexpr State() {
 		a.objs.push_back(Object{});                                    // None
@@ -444,7 +461,7 @@ CTPY_EXPORT template <typename ArenaT = Arena<>> struct State {
 	constexpr std::uint32_t raise_error(ex_kind type, std::initializer_list<std::string_view> parts) noexcept {
 		if (!raised) {
 			raised = true;
-			error = PyError{.type = type};
+			error = PyError{.type = type, .line = current_line};
 			for (const std::string_view part : parts) {
 				error.append(part);
 			}

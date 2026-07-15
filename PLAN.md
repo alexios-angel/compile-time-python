@@ -464,6 +464,55 @@ manual `cp -R` + `diff -rq` in CLAUDE.md.
     the ctc precondition trap (build error naming the violation),
     never an exception.
 
+- **M9 diagnostics: DONE.** diag.hpp (error_stage/error_kind,
+  ctpy::error_info<Src>() structured fields, error_message<Src>()
+  caret rendering via the ctlark size-pass/fill-pass idiom, re-authored
+  under ctpy::), traceback line numbers end to end, run<>'s stage-named
+  hard error, and the CPython parity suite. Design notes:
+  - *Line threading is a logical-line ORDINAL, not a physical line, at
+    parse time.* The prelexer cannot tag the marker stream with numbers
+    (the grammar would have to parse them), and CTLL actions never see
+    the input position - so prelex emits a side table
+    (prelex_result::lines, logical ordinal -> 1-based physical line,
+    plus src_map: marker index -> raw source offset) and the PARSE
+    counts logical lines itself: a type-level counter mk::lc<N> seeded
+    at the bottom of the parse stack (parse.hpp start_context), bumped
+    by the new @bump_line action placed after every consumed NEWL in
+    the grammar (and only there). @end_stmt wraps each simple statement
+    in ast::lined<N, Stmt>; compound headers stash the ordinal in their
+    marker (ifm<N>/whilem<N>/form<N>/defm<N>/elifm<N>) and hdr_folded
+    wraps when the suite closes; elif clauses carry their OWN line
+    inside the clause_pack. exec of lined<N, S> stamps
+    State::current_line through State::line_map (seeded per entry point
+    from prelex_raw<Src>.lines); raise_error copies it into
+    PyError::line. Loop executors re-stamp the header line before every
+    test/target evaluation, so a while-test raising on iteration 40
+    still reports the while line. Granularity is per-STATEMENT
+    (documented deviation: expressions in a multi-line statement report
+    the statement's first line - which is also CPython's line for the
+    common cases, since a continued statement reports where it began).
+  - *error_info is stage-first*: prelex failures carry the prelexer's
+    own offset (fail() now records one: opening quote for unterminated
+    strings, first content char for dedent errors); parse failures take
+    CTLL's reject position IN THE MARKER STREAM and map it back through
+    src_map before locate() computes line/column over the raw source.
+    is_valid<> stays a plain bool; error_info/error_message never
+    hard-error (valid sources report stage none / empty message).
+  - *run/eval/module/pymodule hard-error naming the stage* via
+    parse.hpp require_valid<Src>(): each stage's message sits on its
+    own static_assert over a plain constexpr bool (the notre masking
+    gotcha - a message on a compound dependent condition drowns in the
+    expansion), and parse_stage_passed is vacuously true when prelex
+    already failed, so exactly one message fires.
+  - *ZeroDivisionError spellings unified to "division by zero"* (and
+    int 0**-1 to "zero to a negative power"): CPython 3.14 - the
+    repo's parity target - merged the old per-type variants.
+  - *Parity harness*: tests/gen_expected.py runs 15 subset snippets
+    under real python3 and writes tests/parity_cases.inc (checked in,
+    CI stays hermetic); tests/parity.cpp static_asserts ok() +
+    stdout()==CPython per case. Snippets avoid documented divergences
+    (dict-view printing, 17-digit float reprs, set display order).
+
 ## Risks
 
 Constexpr budget blowups (mitigations: LL(1) not Earley, loops not recursion
