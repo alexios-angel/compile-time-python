@@ -24,5 +24,11 @@
 
 #include "ctpy/version.hpp"
 #include "ctpy/prelex.hpp"
+#include "ctpy/text.hpp"
+#include "ctpy/ast.hpp"
+#include "ctll.hpp"
+#include "ctpy/python.hpp"
+#include "ctpy/actions.hpp"
+#include "ctpy/parse.hpp"
 
 #endif

@@ -181,6 +181,58 @@ manual `cp -R` + `diff -rq` in CLAUDE.md.
   limits (tripwire for constexpr-step regressions).
 - Negative tests assert structured fields (kind/line/col), not compiler text.
 
+## Progress notes
+
+- **M1 prelex: DONE.** Marker-stream golden tests in tests/prelex.cpp.
+- **M2 grammar: DONE.** `include/ctpy/python.lark` (Lark dialect,
+  `@action` hooks) generates conflict-free under `tablewright --check
+  --lang=lark` (Q-grammar, 204 nonterminals / 579 productions before
+  factoring, 78 actions); `make regrammar` emits python.hpp. Design
+  notes vs. section 3, learned the hard way at character level:
+  - *Expression tiers are NOT stratified in the grammar.* At character
+    level `*` vs `**`, `<` vs `<<` vs `<=` and `=` vs `==` make
+    textbook tiers non-LL(1) (the `pow_rest` epsilon conflicts with
+    `term_rest` on `*`). Instead the grammar recognizes one flat
+    operand/operator loop (`xloop`, statement-level `sloop`) with
+    single-character dispatchers, and actions.hpp folds the pending
+    stack with a Python precedence table (Pratt folding on the type
+    stack; `**` right-assoc, chained comparisons fold into one
+    compare node). AST-shape asserts pin the precedence.
+  - *Keyword vs identifier* is ctlark-style chains with residual
+    character classes (NCN* = name chars minus the expected letter) at
+    statement starts (if/while/for/def/return/break/continue/pass) and
+    operand starts (None/True/False/not, f-string prefix). At operator
+    positions keywords need only a boundary guard (@kw_reject). One
+    extra discipline everywhere a keyword just ended at a name
+    boundary: the continuation may not start with a name character
+    unless a space intervenes (`bval`/`opnd_sym`/`sloop_nb`), which is
+    exactly Python's tokenization ("ifx"/"x ory" are names).
+  - *elif/else attachment is flat*: clauses are statement-level items
+    the actions attach to the still-attachable if/while/for node on
+    top of the stack (rejecting stray/misplaced clauses), so suites
+    never need context-split statement lists.
+  - Reserved words as plain names are rejected semantically in
+    @mk_name/@mk_attr against the full Python keyword list ("del x",
+    "import os", "lambda = 1" all fail is_valid).
+  - 78 actions (plan said ~35-45): the string machinery (three-state
+    triple-quote counting x2 quote kinds) and the aug-assign/compare
+    dispatchers cost more, but each action is a few lines.
+  - Grammar subset exclusions beyond section 3 (all rejected, easy to
+    add later): exponent literals (1e5), hex/oct/bin, leading-dot
+    floats (.5), implicit string concatenation ('a' 'b'), r/b/u
+    prefixes, semicolons, tuple subscripts a[1,2], parenthesized or
+    subscript/attribute for-targets, bare testlist as for-iterable
+    (use parens: `for x in (a, b):`), annotations. Known superset
+    acceptances (invalid Python that parses; harmless before M9
+    diagnostics): `1if x else 2`-style digit-keyword adjacency,
+    `return`/`break` outside their proper context (semantic checks
+    land with the interpreter).
+- M2 wiring: text.hpp (`ctpy::text<Cs...>` + to_sv), ast.hpp
+  (type-level nodes), actions.hpp (context<>/mk::* + precedence
+  folding), parse.hpp (`detail::parse_def`, `detail::parsed_module`,
+  public `ctpy::is_valid<Src>`), tests/parse.cpp (positive/negative +
+  AST-shape static_asserts).
+
 ## Risks
 
 Constexpr budget blowups (mitigations: LL(1) not Earley, loops not recursion

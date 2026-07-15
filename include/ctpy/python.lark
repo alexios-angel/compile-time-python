@@ -1,0 +1,840 @@
+// Grammar of the ctpy v0.1 Python subset, for Tablewright's Lark
+// frontend. This file is the source of truth for python.hpp, the
+// character-level (q)LL(1) parse table that CTLL walks over the
+// PRE-LEXED script while your C++ compiles. Regenerate with:
+//
+//     make regrammar
+//
+// The parser does not see raw Python: prelex.hpp has already turned
+// indentation into markers, so the token vocabulary here is plain
+// characters plus four control codes:
+//
+//     \x01 INDENT   \x02 DEDENT   \x03 NEWLINE   \x04 ENDMARKER
+//
+// There is NO lexer. Every multi-character token is spelled out and
+// disambiguated character by character:
+//
+//   * keyword vs identifier is maximal munch by construction: each
+//     statement/operand keyword is a chain of states ("b","r","e","a",
+//     "k") where every state also accepts the RESIDUAL name characters
+//     (NCN* sets = name chars minus the expected one) continuing as an
+//     identifier, and epsilon = the name ended here. Only when the
+//     whole keyword is followed by a non-name character does the
+//     keyword production fire ("breaker = 1" is an assignment).
+//   * operators that share a prefix ("*" "**" "*=" "**=", "<" "<<"
+//     "<=" "<<=") are dispatched one character at a time; Q-grammar
+//     shift-beats-epsilon does the rest.
+//   * expressions are ONE flat operator loop (xloop / statement-level
+//     sloop), not nested tiers: at character level "*" vs "**" and "<"
+//     vs "<<" vs "<=" make textbook stratified tiers non-LL(1), so the
+//     grammar recognizes a linear operand/operator soup and the
+//     semantic actions (actions.hpp) fold it with a precedence table
+//     (this is milestone-documented in PLAN.md).
+//   * keyword operators (or/and/in/is/not in/if/else) appear only at
+//     operator positions where an identifier is illegal, so they need
+//     no identifier fallback - just a boundary guard: a name character
+//     right after the keyword folds to @kw_reject ("x ory" is not
+//     "x or y").
+//   * tuple-vs-paren, dict-vs-set, index-vs-slice, call kwargs,
+//     assignment targets and elif/else attachment are decided by the
+//     actions from markers on the type stack; the grammar only has to
+//     recognize the character sequence.
+//
+// v0.1 grammar subset (see PLAN.md section 3): simple and compound
+// statements over the marker stream; assignment / chained assignment /
+// augmented assignment; the full operator set with precedence folded
+// in actions; call/index/slice/attribute postfix; list/tuple/dict/set
+// displays; def with positional and default parameters; if/elif/else,
+// while/else, for/else; return/break/continue/pass; plain and
+// f-prefixed strings (single, double, triple quoted - f-strings kept
+// as raw atoms until M7); decimal int and basic float literals.
+// NOT in the grammar (rejected, documented): comprehensions, lambda,
+// classes, try/with/import execution, r/b/u string prefixes, hex/oct/
+// bin/exponent literals, leading-dot floats, semicolons, implicit
+// string concatenation, star-args, subscript/attribute for-targets,
+// tuple subscripts a[1,2], annotations.
+
+// ---------------------------------------------------------------------------
+// The pre-lexer's markers and single-character sets
+// ---------------------------------------------------------------------------
+
+INDENT: "\x01"
+DEDENT: "\x02"
+NEWL: "\x03"
+ENDMARK: "\x04"
+SP: /[ \t]/
+DIGIT: /[0-9]/
+
+// identifier characters
+IDSTART: /[A-Za-z_]/
+NAMECHAR: /[A-Za-z0-9_]/
+// identifier start minus lowercase i (for-target after comma: "in" ends the list)
+IDNOI: /[A-Za-hj-z_]/
+// statement-position identifier starts that begin NO keyword chain
+// (letters minus b c d e f i n p r w F N T, plus underscore)
+STMTIDREST: /[aghj-moqs-vx-zA-EG-MO-SU-Z_]/
+// operand-position identifier starts that begin no chain
+// (letters minus f n F N T, plus underscore)
+EXPRIDREST: /[a-eg-mo-zA-EG-MO-SU-Z_]/
+
+// residual name characters: NAMECHAR minus the chain's expected letter(s)
+NCNA: /[A-Zb-z0-9_]/
+NCNE: /[A-Za-df-z0-9_]/
+NCNF: /[A-Za-eg-z0-9_]/
+NCNH: /[A-Za-gi-z0-9_]/
+NCNI: /[A-Za-hj-z0-9_]/
+NCNK: /[A-Za-jl-z0-9_]/
+NCNL: /[A-Za-km-z0-9_]/
+NCNN: /[A-Za-mo-z0-9_]/
+NCNO: /[A-Za-np-z0-9_]/
+NCNR: /[A-Za-qs-z0-9_]/
+NCNS: /[A-Za-rt-z0-9_]/
+NCNT: /[A-Za-su-z0-9_]/
+NCNU: /[A-Za-tv-z0-9_]/
+NCNIS: /[A-Za-hj-rt-z0-9_]/
+
+// string-literal content (the prelexer guarantees termination)
+SQBODY: /[^'\\]/
+DQBODY: /[^"\\]/
+ESCANY: /[^\x00]/
+
+// ---------------------------------------------------------------------------
+// Module structure: a statement list, then the ENDMARKER
+// ---------------------------------------------------------------------------
+
+start: stmt_list ENDMARK @end_module
+
+stmt_list: statement stmt_list
+         |
+
+// inline whitespace (never significant: indentation is already markers)
+ws: SP ws
+  |
+
+// ---------------------------------------------------------------------------
+// Statements. The first character decides: a keyword chain, a plain
+// name, or an expression opener. Simple statements end in stmt_tail
+// (the statement-level operator loop, then NEWLINE); compound
+// statements own their suite and end without a NEWLINE of their own.
+// ---------------------------------------------------------------------------
+
+statement: "b" @begin_text @push_char ks_b1
+         | "c" @begin_text @push_char ks_c1
+         | "d" @begin_text @push_char ks_d1
+         | "e" @begin_text @push_char ks_e1
+         | "f" @begin_text @push_char ks_f1
+         | "i" @begin_text @push_char ks_i1
+         | "n" @begin_text @push_char ks_n1
+         | "p" @begin_text @push_char ks_p1
+         | "r" @begin_text @push_char ks_r1
+         | "w" @begin_text @push_char ks_w1
+         | "F" @begin_text @push_char ks_cf1
+         | "N" @begin_text @push_char ks_cn1
+         | "T" @begin_text @push_char ks_ct1
+         | STMTIDREST @begin_text @push_char name_tail stmt_tail
+         | DIGIT @begin_text @push_char int_tail stmt_tail
+         | "'" @begin_str sq1 stmt_tail
+         | "\"" @begin_str dq1 stmt_tail
+         | "(" @open_paren par1 stmt_tail
+         | "[" @open_list lst1 stmt_tail
+         | "{" @open_brace brc1 stmt_tail
+         | "-" @op_neg ws opnd stmt_tail
+         | "+" @op_pos ws opnd stmt_tail
+         | "~" @op_inv ws opnd stmt_tail
+
+stmt_tail: sloop NEWL @end_stmt
+
+// the no-boundary variant, entered right after an identifier or
+// keyword-literal atom ended a chain: an adjacent name character was
+// consumed by maximal munch, so a keyword operator (or/and/...) here
+// needs at least one space first - one SP unlocks the full sloop
+stmt_tail_nb: sloop_nb NEWL @end_stmt
+
+line_end: SP line_end
+        | NEWL @end_stmt
+
+// shared identifier tail: gobble name characters, fold at the boundary
+// (@mk_name rejects reserved words used as plain names)
+name_tail: NAMECHAR @push_char name_tail
+         | @mk_name
+
+// ---------------------------------------------------------------------------
+// Statement keyword chains (maximal munch with identifier fallback)
+// ---------------------------------------------------------------------------
+
+// break
+ks_b1: "r" @push_char ks_b2
+     | NCNR @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_b2: "e" @push_char ks_b3
+     | NCNE @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_b3: "a" @push_char ks_b4
+     | NCNA @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_b4: "k" @push_char ks_b5
+     | NCNK @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_b5: NAMECHAR @push_char name_tail stmt_tail
+     | @kw_break line_end
+
+// continue
+ks_c1: "o" @push_char ks_c2
+     | NCNO @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_c2: "n" @push_char ks_c3
+     | NCNN @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_c3: "t" @push_char ks_c4
+     | NCNT @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_c4: "i" @push_char ks_c5
+     | NCNI @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_c5: "n" @push_char ks_c6
+     | NCNN @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_c6: "u" @push_char ks_c7
+     | NCNU @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_c7: "e" @push_char ks_c8
+     | NCNE @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_c8: NAMECHAR @push_char name_tail stmt_tail
+     | @kw_continue line_end
+
+// def
+ks_d1: "e" @push_char ks_d2
+     | NCNE @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_d2: "f" @push_char ks_d3
+     | NCNF @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_d3: NAMECHAR @push_char name_tail stmt_tail
+     | @kw_def def_gap
+
+// elif / else (legal only right after an if/loop suite - the actions
+// check that and reject a stray clause)
+ks_e1: "l" @push_char ks_e2
+     | NCNL @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_e2: "i" @push_char ks_e3f
+     | "s" @push_char ks_e3s
+     | NCNIS @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_e3f: "f" @push_char ks_e4f
+      | NCNF @push_char name_tail stmt_tail
+      | @mk_name stmt_tail_nb
+ks_e4f: NAMECHAR @push_char name_tail stmt_tail
+      | @kw_elif header
+ks_e3s: "e" @push_char ks_e4s
+      | NCNE @push_char name_tail stmt_tail
+      | @mk_name stmt_tail_nb
+ks_e4s: NAMECHAR @push_char name_tail stmt_tail
+      | @kw_else colon_suite
+
+// for (an f can also open an f-string atom)
+ks_f1: "o" @push_char ks_f2
+     | "'" @begin_fstr sq1 stmt_tail
+     | "\"" @begin_fstr dq1 stmt_tail
+     | NCNO @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_f2: "r" @push_char ks_f3
+     | NCNR @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_f3: NAMECHAR @push_char name_tail stmt_tail
+     | @kw_for for_gap
+
+// if
+ks_i1: "f" @push_char ks_i2
+     | NCNF @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_i2: NAMECHAR @push_char name_tail stmt_tail
+     | @kw_if header
+
+// not (a statement can be a bare "not x" expression)
+ks_n1: "o" @push_char ks_n2
+     | NCNO @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_n2: "t" @push_char ks_n3
+     | NCNT @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_n3: NAMECHAR @push_char name_tail stmt_tail
+     | @op_not bval stmt_tail
+
+// pass
+ks_p1: "a" @push_char ks_p2
+     | NCNA @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_p2: "s" @push_char ks_p3
+     | NCNS @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_p3: "s" @push_char ks_p4
+     | NCNS @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_p4: NAMECHAR @push_char name_tail stmt_tail
+     | @kw_pass line_end
+
+// return
+ks_r1: "e" @push_char ks_r2
+     | NCNE @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_r2: "t" @push_char ks_r3
+     | NCNT @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_r3: "u" @push_char ks_r4
+     | NCNU @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_r4: "r" @push_char ks_r5
+     | NCNR @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_r5: "n" @push_char ks_r6
+     | NCNN @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_r6: NAMECHAR @push_char name_tail stmt_tail
+     | @kw_return ret_val
+
+ret_val: SP ret_ws
+       | NEWL @end_stmt
+       | opnd_sym stmt_tail
+ret_ws: SP ret_ws
+      | NEWL @end_stmt
+      | opnd stmt_tail
+
+// while
+ks_w1: "h" @push_char ks_w2
+     | NCNH @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_w2: "i" @push_char ks_w3
+     | NCNI @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_w3: "l" @push_char ks_w4
+     | NCNL @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_w4: "e" @push_char ks_w5
+     | NCNE @push_char name_tail stmt_tail
+     | @mk_name stmt_tail_nb
+ks_w5: NAMECHAR @push_char name_tail stmt_tail
+     | @kw_while header
+
+// False
+ks_cf1: "a" @push_char ks_cf2
+      | NCNA @push_char name_tail stmt_tail
+      | @mk_name stmt_tail_nb
+ks_cf2: "l" @push_char ks_cf3
+      | NCNL @push_char name_tail stmt_tail
+      | @mk_name stmt_tail_nb
+ks_cf3: "s" @push_char ks_cf4
+      | NCNS @push_char name_tail stmt_tail
+      | @mk_name stmt_tail_nb
+ks_cf4: "e" @push_char ks_cf5
+      | NCNE @push_char name_tail stmt_tail
+      | @mk_name stmt_tail_nb
+ks_cf5: NAMECHAR @push_char name_tail stmt_tail
+      | @mk_false stmt_tail_nb
+
+// None
+ks_cn1: "o" @push_char ks_cn2
+      | NCNO @push_char name_tail stmt_tail
+      | @mk_name stmt_tail_nb
+ks_cn2: "n" @push_char ks_cn3
+      | NCNN @push_char name_tail stmt_tail
+      | @mk_name stmt_tail_nb
+ks_cn3: "e" @push_char ks_cn4
+      | NCNE @push_char name_tail stmt_tail
+      | @mk_name stmt_tail_nb
+ks_cn4: NAMECHAR @push_char name_tail stmt_tail
+      | @mk_none stmt_tail_nb
+
+// True
+ks_ct1: "r" @push_char ks_ct2
+      | NCNR @push_char name_tail stmt_tail
+      | @mk_name stmt_tail_nb
+ks_ct2: "u" @push_char ks_ct3
+      | NCNU @push_char name_tail stmt_tail
+      | @mk_name stmt_tail_nb
+ks_ct3: "e" @push_char ks_ct4
+      | NCNE @push_char name_tail stmt_tail
+      | @mk_name stmt_tail_nb
+ks_ct4: NAMECHAR @push_char name_tail stmt_tail
+      | @mk_true stmt_tail_nb
+
+// ---------------------------------------------------------------------------
+// Compound statement plumbing: headers, suites, def, for
+// ---------------------------------------------------------------------------
+
+// "if"/"elif"/"while" header (and the for-loop iterable): a test
+// expression, a colon, a suite. The keyword just ended at a name
+// boundary, so the test either starts with a non-name character or
+// needs a space first ("if x:", "if(x):" - but "ifx" was a name).
+header: bval xloop ":" @begin_suite suite
+
+// "else" header
+colon_suite: ws ":" @begin_suite suite
+
+// a suite is either inline (one simple statement on the same line) or
+// a NEWLINE INDENT block DEDENT
+suite: SP suite
+     | NEWL suite_block
+     | statement @close_inline
+
+suite_block: INDENT stmt_list DEDENT @close_block
+
+// def name ( params ) : suite  (a space is required before the name:
+// "defx" was an identifier, so the keyword path only proceeds via SP)
+def_gap: SP def_name
+def_name: SP def_name
+        | IDSTART @begin_text @push_char name_tail def_lp
+def_lp: SP def_lp
+      | "(" @open_params prm1
+prm1: SP prm1
+    | ")" @close_params def_colon
+    | IDSTART @begin_text @push_char name_tail prm2
+prm2: SP prm2
+    | "=" @mk_kweq ws opnd xloop prm3
+    | "," @sep_comma prm4
+    | ")" @close_params def_colon
+prm3: "," @sep_comma prm4
+    | ")" @close_params def_colon
+prm4: SP prm4
+    | ")" @close_params def_colon
+    | IDSTART @begin_text @push_char name_tail prm2
+def_colon: SP def_colon
+         | ":" @begin_suite suite
+
+// for targets in iterable : suite  (targets: names and commas; "in"
+// after a trailing comma needs its own chain since names may start
+// with i)
+for_gap: SP for_t1
+for_t1: SP for_t1
+      | IDSTART @begin_text @push_char name_tail for_t2
+for_t2: SP for_t2
+      | "," @sep_comma for_t3
+      | "i" for_in1
+for_in1: "n" for_in2
+for_in2: NAMECHAR @kw_reject for_in2
+       | @for_in header
+for_t3: SP for_t3
+      | "i" @begin_text @push_char ft_i1
+      | IDNOI @begin_text @push_char name_tail for_t2
+ft_i1: "n" @push_char ft_i2
+     | NCNN @push_char name_tail for_t2
+     | @mk_name for_t2_nb
+// target-list state at a name boundary: "in" needs a space first
+for_t2_nb: SP for_t2
+         | "," @sep_comma for_t3
+ft_i2: NAMECHAR @push_char name_tail for_t2
+     | @for_in header
+
+// ---------------------------------------------------------------------------
+// Operands: unary prefixes, atoms, and the operand keyword chains
+// (None/True/False/not and the f-string prefix). No leading whitespace
+// here - callers weave in ws explicitly.
+// ---------------------------------------------------------------------------
+
+opnd: "-" @op_neg ws opnd
+    | "+" @op_pos ws opnd
+    | "~" @op_inv ws opnd
+    | DIGIT @begin_text @push_char int_tail
+    | "'" @begin_str sq1
+    | "\"" @begin_str dq1
+    | "(" @open_paren par1
+    | "[" @open_list lst1
+    | "{" @open_brace brc1
+    | "f" @begin_text @push_char kx_f1
+    | "n" @begin_text @push_char kx_n1
+    | "N" @begin_text @push_char kx_cn1
+    | "T" @begin_text @push_char kx_ct1
+    | "F" @begin_text @push_char kx_cf1
+    | EXPRIDREST @begin_text @push_char name_tail
+
+// operand entry at a name boundary (right after a keyword like "or",
+// "not", "return", "if"): an adjacent name character would have been
+// part of the keyword's identifier reading, so only non-name starters
+// are allowed here - one space unlocks the full operand set
+opnd_sym: "-" @op_neg ws opnd
+        | "+" @op_pos ws opnd
+        | "~" @op_inv ws opnd
+        | "'" @begin_str sq1
+        | "\"" @begin_str dq1
+        | "(" @open_paren par1
+        | "[" @open_list lst1
+        | "{" @open_brace brc1
+bval: SP ws opnd
+    | opnd_sym
+
+// f-string or identifier starting with f
+kx_f1: "'" @begin_fstr sq1
+     | "\"" @begin_fstr dq1
+     | NAMECHAR @push_char name_tail
+     | @mk_name
+
+// not (prefix) or identifier
+kx_n1: "o" @push_char kx_n2
+     | NCNO @push_char name_tail
+     | @mk_name
+kx_n2: "t" @push_char kx_n3
+     | NCNT @push_char name_tail
+     | @mk_name
+kx_n3: NAMECHAR @push_char name_tail
+     | @op_not bval
+
+// None
+kx_cn1: "o" @push_char kx_cn2
+      | NCNO @push_char name_tail
+      | @mk_name
+kx_cn2: "n" @push_char kx_cn3
+      | NCNN @push_char name_tail
+      | @mk_name
+kx_cn3: "e" @push_char kx_cn4
+      | NCNE @push_char name_tail
+      | @mk_name
+kx_cn4: NAMECHAR @push_char name_tail
+      | @mk_none
+
+// True
+kx_ct1: "r" @push_char kx_ct2
+      | NCNR @push_char name_tail
+      | @mk_name
+kx_ct2: "u" @push_char kx_ct3
+      | NCNU @push_char name_tail
+      | @mk_name
+kx_ct3: "e" @push_char kx_ct4
+      | NCNE @push_char name_tail
+      | @mk_name
+kx_ct4: NAMECHAR @push_char name_tail
+      | @mk_true
+
+// False
+kx_cf1: "a" @push_char kx_cf2
+      | NCNA @push_char name_tail
+      | @mk_name
+kx_cf2: "l" @push_char kx_cf3
+      | NCNL @push_char name_tail
+      | @mk_name
+kx_cf3: "s" @push_char kx_cf4
+      | NCNS @push_char name_tail
+      | @mk_name
+kx_cf4: "e" @push_char kx_cf5
+      | NCNE @push_char name_tail
+      | @mk_name
+kx_cf5: NAMECHAR @push_char name_tail
+      | @mk_false
+
+// number literals: decimal integer, basic float (no exponent)
+int_tail: DIGIT @push_char int_tail
+        | "." @push_char frac_tail
+        | @mk_int
+frac_tail: DIGIT @push_char frac_tail
+         | @mk_float
+
+// ---------------------------------------------------------------------------
+// The nested-expression operator loop (xloop): postfix trailers,
+// binary/ternary operators, keyword operators with boundary guards.
+// Ends (epsilon) at any character it does not know - the enclosing
+// construct owns commas, colons and closers.
+// ---------------------------------------------------------------------------
+
+xloop: SP xloop
+     | "+" @op_add ws opnd xloop
+     | "-" @op_sub ws opnd xloop
+     | "*" x_star
+     | "/" x_slash
+     | "%" @op_mod ws opnd xloop
+     | "&" @op_band ws opnd xloop
+     | "|" @op_bor ws opnd xloop
+     | "^" @op_bxor ws opnd xloop
+     | "<" x_lt
+     | ">" x_gt
+     | "!" x_bang
+     | "=" x_eq
+     | "." dot_attr xloop
+     | "(" @open_call arg1 xloop
+     | "[" @open_sub sub1 xloop
+     | "o" x_or1
+     | "a" x_and1
+     | "i" x_i1
+     | "n" x_ni1
+     | "e" x_el1
+     |
+
+x_star: "*" @op_pow ws opnd xloop
+      | @op_mul ws opnd xloop
+x_slash: "/" @op_fdiv ws opnd xloop
+       | @op_div ws opnd xloop
+x_lt: "<" @op_shl ws opnd xloop
+    | "=" @op_le ws opnd xloop
+    | @op_lt ws opnd xloop
+x_gt: ">" @op_shr ws opnd xloop
+    | "=" @op_ge ws opnd xloop
+    | @op_gt ws opnd xloop
+x_bang: "=" @op_ne ws opnd xloop
+x_eq: "=" @op_eq ws opnd xloop
+    | @mk_kweq ws opnd xloop
+x_or1: "r" x_or2
+x_or2: NAMECHAR @kw_reject x_or2
+     | @op_or bval xloop
+x_and1: "n" x_and2
+x_and2: "d" x_and3
+x_and3: NAMECHAR @kw_reject x_and3
+      | @op_and bval xloop
+x_i1: "n" x_in2
+    | "f" x_if2
+    | "s" x_is2
+x_in2: NAMECHAR @kw_reject x_in2
+     | @op_in bval xloop
+x_if2: NAMECHAR @kw_reject x_if2
+     | @tern_if bval xloop
+x_is2: NAMECHAR @kw_reject x_is2
+     | @op_is bval xloop
+x_ni1: "o" x_ni2
+x_ni2: "t" x_ni3
+x_ni3: NAMECHAR @kw_reject x_ni3
+     | SP x_ni4
+x_ni4: SP x_ni4
+     | "i" x_ni5
+x_ni5: "n" x_ni6
+x_ni6: NAMECHAR @kw_reject x_ni6
+     | @op_nin bval xloop
+x_el1: "l" x_el2
+x_el2: "s" x_el3
+x_el3: "e" x_el4
+x_el4: NAMECHAR @kw_reject x_el4
+     | @tern_else bval xloop
+
+// attribute access: . name (spaces allowed around the dot)
+dot_attr: SP dot_attr
+        | IDSTART @begin_text @push_char attr_tail
+attr_tail: NAMECHAR @push_char attr_tail
+         | @mk_attr
+
+// ---------------------------------------------------------------------------
+// The statement-level operator loop (sloop): everything xloop does,
+// plus tuple commas, assignment (= after a testlist), augmented
+// assignment (+= -= *= /= //= %= **= &= |= ^= <<= >>=). @mk_assign /
+// @mk_aug validate the left side as an assignment target.
+// ---------------------------------------------------------------------------
+
+sloop: SP sloop
+     | "," @sep_comma scomma
+     | "+" s_plus
+     | "-" s_minus
+     | "*" s_star
+     | "/" s_slash
+     | "%" s_pct
+     | "&" s_amp
+     | "|" s_vbar
+     | "^" s_hat
+     | "<" s_lt
+     | ">" s_gt
+     | "!" s_bang
+     | "=" s_eq
+     | "." dot_attr sloop
+     | "(" @open_call arg1 sloop
+     | "[" @open_sub sub1 sloop
+     | "o" s_or1
+     | "a" s_and1
+     | "i" s_i1
+     | "n" s_ni1
+     | "e" s_el1
+     |
+
+// sloop at a name boundary: identical to sloop minus the keyword
+// operators (o/a/i/n/e productions) - an adjacent name character was
+// part of the identifier, so "x or y" needs the space, while symbol
+// operators, trailers and assignment attach directly ("x=1", "x.y")
+sloop_nb: SP sloop
+        | "," @sep_comma scomma
+        | "+" s_plus
+        | "-" s_minus
+        | "*" s_star
+        | "/" s_slash
+        | "%" s_pct
+        | "&" s_amp
+        | "|" s_vbar
+        | "^" s_hat
+        | "<" s_lt
+        | ">" s_gt
+        | "!" s_bang
+        | "=" s_eq
+        | "." dot_attr sloop
+        | "(" @open_call arg1 sloop
+        | "[" @open_sub sub1 sloop
+        |
+
+// after a statement-level comma: next element, a trailing-comma
+// assignment ("a, = xs"), or the end of the line ("x = 1,")
+scomma: SP scomma
+      | "=" @mk_assign ws opnd sloop
+      | opnd sloop
+      |
+
+s_plus: "=" @op_add @mk_aug ws opnd sloop
+      | @op_add ws opnd sloop
+s_minus: "=" @op_sub @mk_aug ws opnd sloop
+       | @op_sub ws opnd sloop
+s_star: "*" s_pow
+      | "=" @op_mul @mk_aug ws opnd sloop
+      | @op_mul ws opnd sloop
+s_pow: "=" @op_pow @mk_aug ws opnd sloop
+     | @op_pow ws opnd sloop
+s_slash: "/" s_fdiv
+       | "=" @op_div @mk_aug ws opnd sloop
+       | @op_div ws opnd sloop
+s_fdiv: "=" @op_fdiv @mk_aug ws opnd sloop
+      | @op_fdiv ws opnd sloop
+s_pct: "=" @op_mod @mk_aug ws opnd sloop
+     | @op_mod ws opnd sloop
+s_amp: "=" @op_band @mk_aug ws opnd sloop
+     | @op_band ws opnd sloop
+s_vbar: "=" @op_bor @mk_aug ws opnd sloop
+      | @op_bor ws opnd sloop
+s_hat: "=" @op_bxor @mk_aug ws opnd sloop
+     | @op_bxor ws opnd sloop
+s_lt: "<" s_shl
+    | "=" @op_le ws opnd sloop
+    | @op_lt ws opnd sloop
+s_shl: "=" @op_shl @mk_aug ws opnd sloop
+     | @op_shl ws opnd sloop
+s_gt: ">" s_shr
+    | "=" @op_ge ws opnd sloop
+    | @op_gt ws opnd sloop
+s_shr: "=" @op_shr @mk_aug ws opnd sloop
+     | @op_shr ws opnd sloop
+s_bang: "=" @op_ne ws opnd sloop
+s_eq: "=" @op_eq ws opnd sloop
+    | @mk_assign ws opnd sloop
+s_or1: "r" s_or2
+s_or2: NAMECHAR @kw_reject s_or2
+     | @op_or bval sloop
+s_and1: "n" s_and2
+s_and2: "d" s_and3
+s_and3: NAMECHAR @kw_reject s_and3
+      | @op_and bval sloop
+s_i1: "n" s_in2
+    | "f" s_if2
+    | "s" s_is2
+s_in2: NAMECHAR @kw_reject s_in2
+     | @op_in bval sloop
+s_if2: NAMECHAR @kw_reject s_if2
+     | @tern_if bval sloop
+s_is2: NAMECHAR @kw_reject s_is2
+     | @op_is bval sloop
+s_ni1: "o" s_ni2
+s_ni2: "t" s_ni3
+s_ni3: NAMECHAR @kw_reject s_ni3
+     | SP s_ni4
+s_ni4: SP s_ni4
+     | "i" s_ni5
+s_ni5: "n" s_ni6
+s_ni6: NAMECHAR @kw_reject s_ni6
+     | @op_nin bval sloop
+s_el1: "l" s_el2
+s_el2: "s" s_el3
+s_el3: "e" s_el4
+s_el4: NAMECHAR @kw_reject s_el4
+     | @tern_else bval sloop
+
+// ---------------------------------------------------------------------------
+// Bracketed constructs. The grammar nests them structurally (so a ]
+// can never close a parenthesis); the actions decide tuple-vs-paren,
+// dict-vs-set, index-vs-slice and kwarg validity from stack markers.
+// ---------------------------------------------------------------------------
+
+// ( ... ) as an atom: empty tuple, grouped expression, or tuple
+par1: SP par1
+    | ")" @close_paren
+    | opnd xloop par2
+par2: "," @sep_comma par3
+    | ")" @close_paren
+par3: SP par3
+    | ")" @close_paren
+    | opnd xloop par2
+
+// [ ... ] as an atom: list display
+lst1: SP lst1
+    | "]" @close_list
+    | opnd xloop lst2
+lst2: "," @sep_comma lst3
+    | "]" @close_list
+lst3: SP lst3
+    | "]" @close_list
+    | opnd xloop lst2
+
+// { ... } as an atom: dict or set display
+brc1: SP brc1
+    | "}" @close_brace
+    | opnd xloop brc2
+brc2: ":" @dict_colon ws opnd xloop brc3
+    | "," @sep_comma brc4
+    | "}" @close_brace
+brc3: "," @sep_comma brc4
+    | "}" @close_brace
+brc4: SP brc4
+    | "}" @close_brace
+    | opnd xloop brc2
+
+// call arguments: positional and name=value (kwargs come out of the
+// generic = dispatch in xloop, validated by @mk_kweq)
+arg1: SP arg1
+    | ")" @close_call
+    | opnd xloop arg2
+arg2: "," @sep_comma arg3
+    | ")" @close_call
+arg3: SP arg3
+    | ")" @close_call
+    | opnd xloop arg2
+
+// subscript: index or slice with optional-flanked colons (a[i], a[i:],
+// a[:j], a[::2], a[i:j:k]); @slice_colon counts the colons
+sub1: SP sub1
+    | ":" @slice_colon sub1
+    | "]" @close_sub
+    | opnd xloop sub2
+sub2: ":" @slice_colon sub1
+    | "]" @close_sub
+
+// ---------------------------------------------------------------------------
+// String literals, copied verbatim into a text accumulator (escape
+// cooking happens in the interpreter, and f-string bodies stay raw
+// until M7). The prelexer already guaranteed termination. Three-state
+// quote counting recognizes triple quotes without lookahead.
+// ---------------------------------------------------------------------------
+
+// single-quoted: 'x', '', or triple '''...'''
+sq1: "'" sq2
+   | "\\" @push_char ESCANY @push_char sq_body
+   | SQBODY @push_char sq_body
+sq_body: "'" @end_str
+       | "\\" @push_char ESCANY @push_char sq_body
+       | SQBODY @push_char sq_body
+sq2: "'" tq_body
+   | @end_str
+tq_body: "'" tq1
+       | "\\" @push_char ESCANY @push_char tq_body
+       | SQBODY @push_char tq_body
+tq1: "'" tq2
+   | "\\" @push_sq @push_char ESCANY @push_char tq_body
+   | SQBODY @push_sq @push_char tq_body
+tq2: "'" @end_str
+   | "\\" @push_sq @push_sq @push_char ESCANY @push_char tq_body
+   | SQBODY @push_sq @push_sq @push_char tq_body
+
+// double-quoted, mirrored
+dq1: "\"" dq2
+   | "\\" @push_char ESCANY @push_char dq_body
+   | DQBODY @push_char dq_body
+dq_body: "\"" @end_str
+       | "\\" @push_char ESCANY @push_char dq_body
+       | DQBODY @push_char dq_body
+dq2: "\"" dtq_body
+   | @end_str
+dtq_body: "\"" dtq1
+        | "\\" @push_char ESCANY @push_char dtq_body
+        | DQBODY @push_char dtq_body
+dtq1: "\"" dtq2
+    | "\\" @push_dq @push_char ESCANY @push_char dtq_body
+    | DQBODY @push_dq @push_char dtq_body
+dtq2: "\"" @end_str
+    | "\\" @push_dq @push_dq @push_char ESCANY @push_char dtq_body
+    | DQBODY @push_dq @push_dq @push_char dtq_body

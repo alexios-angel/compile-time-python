@@ -82,6 +82,16 @@ len, range, sum, min, max, abs, str, int, bool, sorted, enumerate, zip;
 f-strings (`{expr}`, no format specs). Deferred: classes, generators,
 comprehensions, try/except, import execution, with, decorators, async.
 
+Done so far: the pre-lexer (indentation -> markers, `ctpy::prelex_ok`) and
+the parser — `python.lark` compiles conflict-free through Tablewright to a
+character-level (q)LL(1) CTLL table, and the semantic actions build the
+type-level AST with precedence folded on the type stack. `ctpy::is_valid<src>`
+is live (a plain bool, never a compile error). Number literals are decimal
+ints and basic floats for now (no exponents/hex), string prefixes are limited
+to `f`, and implicit string concatenation, semicolons, tuple subscripts
+(`a[1, 2]`) and comprehensions are out of the v0.1 grammar — see PLAN.md
+progress notes for the full list. The interpreter (`ctpy::run`) is next.
+
 ## Build & test
 
 Compiling the tests IS the test — `tests/*.cpp` are `static_assert` suites.

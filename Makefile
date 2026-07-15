@@ -7,8 +7,9 @@ CXX_STANDARD := 20
 PYTHON := python3
 
 # LL1q parser generator: https://github.com/alexios-angel/Tablewright
-# (needs python3 with the lark package)
-TABLEWRIGHT := tablewright
+# (needs python3 with the lark package). Not installed? Run it from a
+# sibling checkout: make regrammar TABLEWRIGHT="PYTHONPATH=../tablewright python3 -m tablewright"
+TABLEWRIGHT ?= tablewright
 
 # a constexpr Python interpreter needs more evaluation budget than the
 # defaults - the parse is linear (q)LL(1), but the tree-walk burns steps
@@ -58,7 +59,7 @@ regrammar:
 
 include/ctpy/python.hpp: include/ctpy/python.lark
 	@echo "LL1q $<"
-	@$(TABLEWRIGHT) --ll --q --lang=lark --input=include/ctpy/python.lark --output=include/ctpy/ --generator=cpp_ctll_v2 --cfg:fname=python.hpp --cfg:namespace=ctpy --cfg:guard=CTPY__PYTHON__HPP --cfg:grammar_name=python_grammar
+	@$(TABLEWRIGHT) --ll --q --lang=lark --input=include/ctpy/python.lark --output=include/ctpy/ --generator=cpp_ctll_v2 --fname=python.hpp --namespace=ctpy --guard=CTPY__PYTHON__HPP --grammar-name=python_grammar
 
 # regenerate tests/parity_cases.inc by running the snippets under the
 # system python3 (offline dev tool; the checked-in file keeps CI hermetic)
