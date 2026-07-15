@@ -21,7 +21,11 @@
 //
 // Calling a NAME dispatches here: a bound name wins (Python lets you
 // shadow builtins), an unbound one is looked up in the builtin table,
-// anything else is a NameError. User-defined function calls land in M5.
+// anything else is a NameError. A bound FUNCTION object (made by a def
+// statement, exec.hpp) is invoked through its type-erased thunk in
+// State::thunks - this call site never sees the def's AST type.
+// Keyword arguments are OUT of the v0.1 call subset (calls are
+// positional-only; a kwarg raises a soft TypeError saying so).
 
 namespace ctpy {
 
@@ -109,20 +113,22 @@ template <typename Text, typename... Args>
 struct evaluator<ast::call_expr<ast::name<Text>, Args...>> {
 	template <typename St> static constexpr std::uint32_t run(St & st) {
 		const std::uint32_t bound = st.lookup(Text::view());
-		if (bound != not_found) {
-			// a binding shadows any builtin; calling def-functions lands
-			// in M5, everything else was never callable
+		if (bound != not_found && st.a.objs[bound].kind != Kind::function) {
+			// a binding shadows any builtin, and only function objects
+			// (and builtins) are callable in the v0.1 subset
 			return st.raise_error(ex_kind::TypeError,
 				{"'", type_name(st.a.objs[bound].kind), "' object is not callable"});
 		}
-		if (!is_builtin(Text::view())) {
+		if (bound == not_found && !is_builtin(Text::view())) {
 			return st.raise_error(ex_kind::NameError,
 				{"name '", Text::view(), "' is not defined"});
 		}
 		if constexpr ((is_kwarg<Args> || ...)) {
 			return st.raise_error(ex_kind::TypeError,
-				{Text::view(), "() takes no keyword arguments"});
+				{Text::view(), "() takes no keyword arguments (ctpy v0.1: calls are positional-only)"});
 		} else {
+			// copy the callee OBJECT before the arguments grow the pool
+			const Object fn = bound != not_found ? st.a.objs[bound] : Object{};
 			std::uint32_t argv[sizeof...(Args) + 1]{};
 			std::size_t at = 0;
 			const bool complete = ((argv[at++] = eval_node<Args, St>(st), !st.raised) && ...);
@@ -130,6 +136,10 @@ struct evaluator<ast::call_expr<ast::name<Text>, Args...>> {
 			(void)at;
 			if (st.raised) {
 				return st.none();
+			}
+			if (bound != not_found) {
+				// a def'd function: dispatch through its type-erased thunk
+				return st.thunks[static_cast<std::size_t>(fn.i)](st, fn, argv, sizeof...(Args));
 			}
 			return call_builtin(st, Text::view(), argv, sizeof...(Args));
 		}

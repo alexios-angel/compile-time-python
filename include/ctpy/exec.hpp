@@ -19,8 +19,8 @@
 // Statement execution: exec<Stmt>(state) -> Flow, the value-level
 // tree-walk over compound statements. Control transfers are FLOW
 // SIGNALS threaded through return values - a break/continue unwinds
-// suites until the innermost loop absorbs it, a return (M5) until the
-// call absorbs it. Python exceptions stay on the soft channel
+// suites until the innermost loop absorbs it, a return until the
+// calling thunk absorbs it. Python exceptions stay on the soft channel
 // (state.raised + PyError, NEVER C++ exceptions): a raised state makes
 // every subsequent statement a no-op and the leftover Flow::next
 // carries the walk out.
@@ -33,9 +33,15 @@
 //     by break;
 //   - for-loops iterate range objects lazily (no materialization) and
 //     str per character;
-//   - break/continue/return that escape to module level are the
-//     SyntaxErrors CPython reports (soft, since the grammar accepts
-//     them anywhere).
+//   - break/continue/return that escape to module level (or a function
+//     body, for break/continue) are the SyntaxErrors CPython reports
+//     (soft, since the grammar accepts them anywhere);
+//   - def is a statement: it executes at flow time, evaluates its
+//     defaults ONCE right then (Python def-time semantics), and binds
+//     a function OBJECT; a call pushes one locals frame and pops it on
+//     any exit; name resolution is own-locals-then-globals, so nested
+//     defs see globals + their own locals only (NO closures in v0.1);
+//     recursion is guarded by the soft RecursionError at depth 100.
 //
 // ctpy::run<Src>() executes a whole module and snapshots the globals
 // into an INTERIM result: ok()/exception() plus ["name"].to<T>() for
@@ -48,7 +54,7 @@ CTPY_EXPORT enum class Flow : unsigned char {
 	next,      // fall through to the next statement
 	break_,    // unwinding to the innermost loop
 	continue_, // unwinding to the innermost loop's next iteration
-	return_,   // unwinding to the innermost call (lands in M5)
+	return_,   // unwinding to the innermost call (value in State::retval)
 };
 
 namespace detail {
@@ -177,6 +183,24 @@ template <> struct executor<ast::break_stmt> {
 template <> struct executor<ast::continue_stmt> {
 	template <typename St> static constexpr Flow run(St &) noexcept {
 		return Flow::continue_;
+	}
+};
+
+// return: stash the value (None for a bare `return`) in the state's
+// return-value channel and signal Flow::return_. The channel cannot be
+// clobbered by a nested call: the innermost thunk reads it the moment
+// the flow reaches it, before any other expression can run.
+template <typename E> struct executor<ast::return_stmt<E>> {
+	template <typename St> static constexpr Flow run(St & st) {
+		if constexpr (std::is_void_v<E>) {
+			st.retval = st.none();
+		} else {
+			st.retval = eval_node<E, St>(st);
+			if (st.raised) {
+				return Flow::next;
+			}
+		}
+		return Flow::return_;
 	}
 };
 
@@ -333,6 +357,164 @@ struct executor<ast::for_stmt<Target, Iter, Body, Else>> {
 			}
 		}
 		return exec_else<Else>(st);
+	}
+};
+
+// --- def / call: the function machinery -----------------------------------
+
+template <typename P> struct param_traits;
+template <typename N, typename D> struct param_traits<ast::param<N, D>> {
+	static constexpr bool has_default = !std::is_void_v<D>;
+	using default_expr = D;
+	static constexpr std::string_view name() noexcept {
+		return N::view();
+	}
+};
+
+// evaluate one parameter's default at DEF time (Python: defaults are
+// evaluated once, when the def statement executes - never per call)
+template <typename P, typename St>
+constexpr bool eval_default(St & st, std::uint32_t * items, std::size_t & used) {
+	if constexpr (param_traits<P>::has_default) {
+		items[used++] = eval_node<typename param_traits<P>::default_expr, St>(st);
+		return !st.raised;
+	} else {
+		(void)st;
+		(void)items;
+		(void)used;
+		return true;
+	}
+}
+
+// The M5 type-erasure choice (PLAN.md section 5): a TABLE OF THUNKS,
+// not a variadic module walk. Executing a def instantiates
+// fn_thunk<Def, St>::call - a constexpr function that owns everything
+// type-level about the def (parameter names, the body suite) - and
+// registers its POINTER in State::thunks; the function Object carries
+// only that index plus its defaults run. A call site (builtins.hpp)
+// dispatches through the pointer without ever naming the def's type.
+// Chosen over re-walking the module's defs variadically per call
+// because the walk is O(defs) at every call, cannot see functions
+// created at run time (nested def, conditional def, aliases), and
+// would entangle the call evaluator with the module type; the pointer
+// also breaks template mutual recursion by construction - recursive
+// and mutually-recursive calls cross a VALUE, not a type.
+template <typename Def, typename St> struct fn_thunk;
+template <typename NameText, typename... Ps, typename Body, typename St>
+struct fn_thunk<ast::def_stmt<NameText, ast::param_pack<Ps...>, Body>, St> {
+	static constexpr std::size_t param_count = sizeof...(Ps);
+	static constexpr std::string_view param_names[param_count + 1] = {param_traits<Ps>::name()..., {}};
+
+	// CPython's wrong-arity TypeErrors, spelled the way a traceback would
+	static constexpr std::uint32_t arity_error(St & st, const Object & fn, std::size_t argc, std::size_t required) {
+		const auto given = dec(static_cast<long long>(argc));
+		if (argc > param_count) {
+			const auto most = dec(static_cast<long long>(param_count));
+			if (fn.count == 0) {
+				return st.raise_error(ex_kind::TypeError,
+					{NameText::view(), "() takes ", most.view(), " positional argument",
+					 param_count == 1 ? "" : "s", " but ", given.view(),
+					 argc == 1 ? " was" : " were", " given"});
+			}
+			const auto least = dec(static_cast<long long>(required));
+			return st.raise_error(ex_kind::TypeError,
+				{NameText::view(), "() takes from ", least.view(), " to ", most.view(),
+				 " positional arguments but ", given.view(), argc == 1 ? " was" : " were", " given"});
+		}
+		const auto missing = dec(static_cast<long long>(required - argc));
+		st.raise_error(ex_kind::TypeError,
+			{NameText::view(), "() missing ", missing.view(), " required positional argument",
+			 required - argc == 1 ? "" : "s", ": "});
+		for (std::size_t at = argc; at < required; ++at) {
+			if (at != argc) {
+				st.error.append(at + 1 == required ? (required - argc == 2 ? " and " : ", and ") : ", ");
+			}
+			st.error.append("'").append(param_names[at]).append("'");
+		}
+		return st.none();
+	}
+
+	static constexpr std::uint32_t call(St & st, const Object & fn, const std::uint32_t * argv, std::size_t argc) {
+		// the SOFT recursion guard: counts live Python calls and raises
+		// RecursionError (default limit 100) long before the compiler's
+		// own -fconstexpr-depth budget could hard-fail the build
+		if (st.depth >= st.recursion_limit) {
+			return st.raise_error(ex_kind::RecursionError, "maximum recursion depth exceeded");
+		}
+		const std::size_t required = param_count - fn.count;
+		if (argc < required || argc > param_count) {
+			return arity_error(st, fn, argc, required);
+		}
+		++st.depth;
+		st.push_frame();
+		// bind parameters left to right: caller-supplied first, then the
+		// def-time defaults [fn.first, fn.first+fn.count) fill the tail
+		std::size_t at = 0;
+		((st.bind(param_traits<Ps>::name(),
+		          at < argc ? argv[at] : fn.first + static_cast<std::uint32_t>(at - required)),
+		  ++at), ...);
+		(void)at;
+		const Flow flow = exec_node<Body, St>(st);
+		st.pop_frame();
+		--st.depth;
+		if (st.raised) {
+			return st.none();
+		}
+		switch (flow) {
+			case Flow::return_:
+				return st.retval;
+			case Flow::break_: // grammar superset: the semantic check lives here
+				return st.raise_error(ex_kind::SyntaxError, "'break' outside loop");
+			case Flow::continue_:
+				return st.raise_error(ex_kind::SyntaxError, "'continue' not properly in loop");
+			case Flow::next:
+				break;
+		}
+		return st.none(); // fell off the end: an implicit `return None`
+	}
+};
+
+// Executing a def EVALUATES ITS DEFAULTS NOW (Python semantics: once,
+// at def time), copies them into one contiguous pool run, registers
+// the body's thunk, and binds the name like any other assignment.
+// A nested def binds in the enclosing call's locals, so the inner name
+// dies with the call; when the inner function runs it sees only its
+// OWN locals + globals (v0.1 has NO closures - an enclosing function's
+// locals are invisible by scope-resolution design, documented).
+template <typename NameText, typename... Ps, typename Body>
+struct executor<ast::def_stmt<NameText, ast::param_pack<Ps...>, Body>> {
+	template <typename St> static constexpr Flow run(St & st) {
+		std::uint32_t items[sizeof...(Ps) + 1]{};
+		std::size_t used = 0;
+		const bool complete = (eval_default<Ps, St>(st, items, used) && ...);
+		(void)complete;
+		if (st.raised) {
+			return Flow::next;
+		}
+		// the defaults run: contiguous copies, like any container display
+		const std::uint32_t first = static_cast<std::uint32_t>(st.a.objs.size());
+		for (std::size_t at = 0; at < used; ++at) {
+			st.a.objs.push_back(st.a.objs[items[at]]);
+		}
+		// register the thunk; a def that executes again (loop, recursion,
+		// redefinition) reuses its slot - the table stays one-per-def
+		using thunk = fn_thunk<ast::def_stmt<NameText, ast::param_pack<Ps...>, Body>, St>;
+		const typename St::function_thunk pointer = &thunk::call;
+		std::size_t index = st.thunks.size();
+		for (std::size_t slot = 0; slot < st.thunks.size(); ++slot) {
+			if (st.thunks[slot] == pointer) {
+				index = slot;
+				break;
+			}
+		}
+		if (index == st.thunks.size()) {
+			st.thunks.push_back(pointer);
+		}
+		st.bind(NameText::view(), st.push(Object{.kind = Kind::function,
+		                                         .i = static_cast<long long>(index),
+		                                         .first = first,
+		                                         .count = static_cast<std::uint32_t>(used)}));
+		return Flow::next;
 	}
 };
 

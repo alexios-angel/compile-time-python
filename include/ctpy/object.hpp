@@ -73,7 +73,8 @@ CTPY_EXPORT constexpr std::string_view type_name(Kind kind) noexcept {
 //   range         [first, first+3) of Arena::objs are the start/stop/step ints
 //   tuple/list/set[first, first+count) of Arena::objs
 //   dict          [first, first+count) of Arena::pairs
-//   function      first = def index (M5)
+//   function      i = State::thunks index; [first, first+count) of
+//                 Arena::objs are the def-time-evaluated defaults
 CTPY_EXPORT struct Object {
 	Kind kind = Kind::none;
 	long long i = 0;
@@ -234,17 +235,28 @@ CTPY_EXPORT inline constexpr std::uint32_t not_found = 0xFFFFFFFFu;
 CTPY_EXPORT template <typename ArenaT = Arena<>> struct State {
 	using arena_type = ArenaT;
 
+	// Calling a def'd function goes through a THUNK: exec.hpp
+	// instantiates one constexpr function per (def AST type, State
+	// type) and registers its pointer here when the def executes. The
+	// pointer ERASES the def's type, so the value-level Object can
+	// reference the type-level AST: a function Object stores its thunk
+	// index in `i` and its defaults as an object-pool run.
+	using function_thunk = std::uint32_t (*)(State &, const Object &, const std::uint32_t *, std::size_t);
+
 	// singleton object-pool indices, seeded by the constructor
 	static constexpr std::uint32_t none_index = 0;
 	static constexpr std::uint32_t false_index = 1;
 	static constexpr std::uint32_t true_index = 2;
 
 	ArenaT a{};
-	ctc::vector<Frame, 128> stack{}; // live call frames (deepest last)
-	std::uint32_t globals_count = 0; // [0, globals_count) of a.frames are globals
+	ctc::vector<Frame, 128> stack{};        // live call frames (deepest last)
+	ctc::vector<function_thunk, 256> thunks{}; // one slot per distinct executed def
+	std::uint32_t globals_count = 0;        // [0, globals_count) of a.frames are globals
+	std::uint32_t retval = none_index;      // the value carried by Flow::return_
 	bool raised = false;
 	PyError error{};
-	int depth = 0;                   // recursion guard counter (M5)
+	int depth = 0;                          // live Python calls (the soft recursion guard)
+	int recursion_limit = 100;              // RecursionError fires here, far below -fconstexpr-depth
 
 	constexpr State() {
 		a.objs.push_back(Object{});                                    // None
@@ -321,6 +333,17 @@ CTPY_EXPORT template <typename ArenaT = Arena<>> struct State {
 	}
 
 	// --- scopes -----------------------------------------------------------
+
+	// enter/leave a call's locals frame; the binding pool truncates
+	// back on leave, so locals never outlive their call (LIFO by
+	// construction - v0.1 has no closures to keep them alive)
+	constexpr void push_frame() {
+		stack.push_back(Frame{static_cast<std::uint32_t>(a.frames.size()), 0});
+	}
+	constexpr void pop_frame() {
+		a.frames.resize(stack.back().first);
+		stack.pop_back();
+	}
 
 	// resolve a name: the innermost frame's locals first (there are no
 	// closures - intermediate frames are invisible), then globals

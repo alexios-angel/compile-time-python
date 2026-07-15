@@ -272,6 +272,34 @@ manual `cp -R` + `diff -rq` in CLAUDE.md.
   "'int' object is not callable", `for i in 5` is "not iterable".
   Tests tests/control.cpp incl. the sum-0..4 checkpoint.
 
+- **M5 functions: DONE.** def/return/call in exec.hpp + the call
+  dispatch in builtins.hpp; tests/functions.cpp incl. the recursive
+  fib(10)==55 checkpoint. The section-4.5 type-erasure choice: a
+  **table of thunks**, not a variadic module walk. Executing a def
+  instantiates `fn_thunk<Def, St>::call` - a constexpr function owning
+  everything type-level about the def (param names, body suite) - and
+  registers its POINTER in `State::thunks` (deduped, one slot per def
+  even when the def re-executes in a loop); the function Object stores
+  that index in `i` and its def-time-evaluated defaults as the
+  `[first, first+count)` object-pool run. Call sites dispatch through
+  the pointer without naming the def's type, which also breaks
+  template mutual recursion by construction (recursive calls cross a
+  VALUE, not a type). Rejected walk: O(defs) per call and blind to
+  functions created at run time (nested/conditional def, aliases).
+  Return values ride `State::retval` next to Flow::return_ (read by
+  the calling thunk before anything else can run). Arity errors spell
+  CPython's TypeErrors exactly (takes/missing forms, name lists,
+  was/were). The soft RecursionError guard raises "maximum recursion
+  depth exceeded" at depth 100: ~7 constexpr frames per Python call
+  keeps the worst case near ~700, safely under -fconstexpr-depth=1024
+  (boundary pinned by tests: count(99) works, count(100) raises).
+  Documented v0.1 deviations: NO closures (a nested def sees globals +
+  its own locals only - enclosing locals are a NameError), and calls
+  are positional-only (a kwarg at a call site is a soft TypeError;
+  builtin sep/end kwargs land with print in M7). break/continue
+  escaping a function body are the same soft SyntaxErrors as at module
+  level.
+
 ## Risks
 
 Constexpr budget blowups (mitigations: LL(1) not Earley, loops not recursion
