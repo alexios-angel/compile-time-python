@@ -66,11 +66,12 @@ include/ctpy/python.hpp: include/ctpy/python.lark
 parity-cases:
 	$(PYTHON) tests/gen_expected.py
 
-# needs python3 with the quom package
+# quom 4.0.2 runs away on this include graph (no dedup), so the amalgam
+# is built by the small guard-aware tools/amalgamate.py instead
 single-header: single-header/ctpy.hpp
 
 single-header/ctpy.hpp:
-	$(PYTHON) -m quom include/ctpy.hpp ctpy.hpp.tmp
+	$(PYTHON) tools/amalgamate.py include/ctpy.hpp ctpy.hpp.tmp -I include
 	echo "/*" > single-header/ctpy.hpp
 	cat LICENSE >> single-header/ctpy.hpp
 	echo "*/" >> single-header/ctpy.hpp
