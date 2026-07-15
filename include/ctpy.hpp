@@ -30,5 +30,7 @@
 #include "ctpy/python.hpp"
 #include "ctpy/actions.hpp"
 #include "ctpy/parse.hpp"
+#include "ctpy/object.hpp"
+#include "ctpy/eval.hpp"
 
 #endif

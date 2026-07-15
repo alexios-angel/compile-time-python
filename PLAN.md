@@ -232,6 +232,23 @@ manual `cp -R` + `diff -rq` in CLAUDE.md.
   folding), parse.hpp (`detail::parse_def`, `detail::parsed_module`,
   public `ctpy::is_valid<Src>`), tests/parse.cpp (positive/negative +
   AST-shape static_asserts).
+- **M3 expressions: DONE.** object.hpp (Kind/Object/Pair/Binding/Frame,
+  `Arena<Objs,Chars,Pairs,Frames,Out>` of append-only ctc pools,
+  `State<>` with globals/frame scopes + raise_error, `ex_kind` with
+  Python-spelled enumerators so `exception() == ctpy::TypeError`
+  reads right, truncating PyError message) and eval.hpp
+  (`eval<Node>(State&)` -> object index; literals cook escapes and
+  parse int/float spellings at evaluation; or/and return the deciding
+  OPERAND; chained comparisons short-circuit per link; Python floor
+  div/mod signs; `**` right-assoc with negative exponent -> float;
+  interim `ctpy::eval<"expr">()` -> eval_result with
+  ok()/exception()/to<T>()/str(), replaced by M8). v0.1 int bounds:
+  `**`/`<<` overflow raises OverflowError (CPython would bignum), a
+  non-integral float exponent raises TypeError (no constexpr pow in
+  C++20); plain +/-/* overflow is still a constexpr hard error
+  (unguarded). Bitwise/shift/in/is implemented beyond the milestone
+  list since the AST already carries them; container branches of
+  object_eq/contains are pre-wired for M6.
 
 ## Risks
 
