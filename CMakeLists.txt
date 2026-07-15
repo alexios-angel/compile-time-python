@@ -53,8 +53,30 @@ set(CTPY_CONSTEXPR_OPTIONS
   $<$<CXX_COMPILER_ID:GNU>:-fconstexpr-ops-limit=3000000000;-fconstexpr-loop-limit=10000000;-fconstexpr-depth=1024>
   $<$<CXX_COMPILER_ID:MSVC>:/constexpr:steps500000000;/constexpr:depth1024>)
 
+# ctc and ctll live in git submodules (git submodule update --init).
+# The extra .../include/ctc and .../include/ctll entries let the headers'
+# relative `"../ctc.hpp"`-style includes (incl. the GENERATED python.hpp,
+# whose include Tablewright fixes) resolve through the quoted-include
+# fallback; the install keeps the flat include/{ctc,ctll,ctpy} layout, so
+# installed consumers need neither.
+set(CTPY_SUBMODULE_INCLUDE_DIRS
+  "${PROJECT_SOURCE_DIR}/external/compile-time-containers/include"
+  "${PROJECT_SOURCE_DIR}/external/compile-time-containers/include/ctc"
+  "${PROJECT_SOURCE_DIR}/external/compile-time-lark/include"
+  "${PROJECT_SOURCE_DIR}/external/compile-time-lark/include/ctll")
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/external/compile-time-containers/include/ctc.hpp"
+   OR NOT EXISTS "${PROJECT_SOURCE_DIR}/external/compile-time-lark/include/ctll.hpp")
+  message(FATAL_ERROR
+    "ctpy: the ctc/ctll submodules are missing - run `git submodule update --init`")
+endif()
+
 file(GLOB_RECURSE CTPY_HEADERS CONFIGURE_DEPENDS
 	include/*.hpp)
+file(GLOB_RECURSE CTPY_CTC_HEADERS CONFIGURE_DEPENDS
+	external/compile-time-containers/include/*.hpp)
+file(GLOB_RECURSE CTPY_CTLL_HEADERS CONFIGURE_DEPENDS
+	external/compile-time-lark/include/ctll.hpp
+	external/compile-time-lark/include/ctll/*.hpp)
 
 if(CTPY_MODULE)
 	if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.29.20240416")
@@ -63,7 +85,11 @@ if(CTPY_MODULE)
 		target_sources(${PROJECT_NAME} PUBLIC FILE_SET CXX_MODULES TYPE CXX_MODULES FILES ctpy.cppm)
 		target_sources(${PROJECT_NAME} PUBLIC FILE_SET HEADERS TYPE HEADERS
 		    BASE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/include"
-		    FILES ${CTPY_HEADERS})
+		        "${CMAKE_CURRENT_SOURCE_DIR}/external/compile-time-containers/include"
+		        "${CMAKE_CURRENT_SOURCE_DIR}/external/compile-time-lark/include"
+		    FILES ${CTPY_HEADERS} ${CTPY_CTC_HEADERS} ${CTPY_CTLL_HEADERS})
+		target_include_directories(${PROJECT_NAME} PUBLIC
+		    $<BUILD_INTERFACE:${CTPY_SUBMODULE_INCLUDE_DIRS}>)
 
 		# we are using `import std;`
 		if (NOT DEFINED CTPY_CXX_STANDARD OR CTPY_CXX_STANDARD LESS 23)
@@ -86,6 +112,7 @@ else()
 
 	target_include_directories(${PROJECT_NAME} INTERFACE
 	  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+	  $<BUILD_INTERFACE:${CTPY_SUBMODULE_INCLUDE_DIRS}>
 	  $<INSTALL_INTERFACE:include>)
 
 	if (NOT CTPY_CXX_STANDARD)
@@ -99,8 +126,15 @@ else()
 	set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_SCAN_FOR_MODULES 0)
 
 	install(TARGETS ${PROJECT_NAME} EXPORT ${PROJECT_NAME}-targets)
+	# the installed tree stays flat - include/{ctpy,ctc,ctll} side by side -
+	# so the headers' relative includes keep working for installed consumers
 	install(DIRECTORY include/ DESTINATION include
 	    FILES_MATCHING PATTERN *.hpp)
+	install(DIRECTORY external/compile-time-containers/include/ DESTINATION include
+	    FILES_MATCHING PATTERN *.hpp)
+	install(DIRECTORY external/compile-time-lark/include/ctll DESTINATION include
+	    FILES_MATCHING PATTERN *.hpp)
+	install(FILES external/compile-time-lark/include/ctll.hpp DESTINATION include)
 endif()
 
 add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME})

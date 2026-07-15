@@ -11,6 +11,8 @@ jobs:
     steps:
       - run: sudo apt-get install g++-${{ matrix.gcc }}
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - run: make CXX=g++-${{ matrix.gcc }}
   clang:
     strategy:
@@ -25,12 +27,16 @@ jobs:
         with:
           version: ${{ matrix.clang }}
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - run: make CXX=clang++
   cmake:
     name: "CMake (configure, build, ctest)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - run: cmake -B build -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build -j
       - run: ctest --test-dir build --output-on-failure

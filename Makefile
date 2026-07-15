@@ -20,7 +20,18 @@ else
 CONSTEXPR_FLAGS := -fconstexpr-ops-limit=3000000000 -fconstexpr-loop-limit=10000000 -fconstexpr-depth=1024
 endif
 
-override CXXFLAGS := $(CXXFLAGS) -std=c++$(CXX_STANDARD) -Iinclude $(CONSTEXPR_FLAGS) -O2 -pedantic -Wall -Wextra -Werror -Wconversion
+# ctc and ctll come from git submodules (run `git submodule update --init`
+# once after cloning). The extra <sub>/include/ctc and <sub>/include/ctll
+# entries let the headers' relative `"../ctc.hpp"`-style includes (incl.
+# the GENERATED python.hpp, whose include Tablewright fixes) resolve
+# through the quoted-include -I fallback.
+SUBMODULE_INCLUDES := \
+	-Iexternal/compile-time-containers/include \
+	-Iexternal/compile-time-containers/include/ctc \
+	-Iexternal/compile-time-lark/include \
+	-Iexternal/compile-time-lark/include/ctll
+
+override CXXFLAGS := $(CXXFLAGS) -std=c++$(CXX_STANDARD) -Iinclude $(SUBMODULE_INCLUDES) $(CONSTEXPR_FLAGS) -O2 -pedantic -Wall -Wextra -Werror -Wconversion
 
 # precompiled header: ctll, ctc, the python_grammar table and the
 # library templates are parsed once here instead of once per TU
@@ -71,7 +82,11 @@ parity-cases:
 single-header: single-header/ctpy.hpp
 
 single-header/ctpy.hpp:
-	$(PYTHON) tools/amalgamate.py include/ctpy.hpp ctpy.hpp.tmp -I include
+	$(PYTHON) tools/amalgamate.py include/ctpy.hpp ctpy.hpp.tmp -I include \
+		-I external/compile-time-containers/include \
+		-I external/compile-time-containers/include/ctc \
+		-I external/compile-time-lark/include \
+		-I external/compile-time-lark/include/ctll
 	echo "/*" > single-header/ctpy.hpp
 	cat LICENSE >> single-header/ctpy.hpp
 	echo "*/" >> single-header/ctpy.hpp

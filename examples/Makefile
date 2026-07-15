@@ -7,7 +7,13 @@ else
 CONSTEXPR_FLAGS := -fconstexpr-ops-limit=3000000000 -fconstexpr-loop-limit=10000000 -fconstexpr-depth=1024
 endif
 
-CXXFLAGS := -std=c++20 -I../include $(CONSTEXPR_FLAGS) -O2 -Wall -Wextra -pedantic
+SUBMODULE_INCLUDES := \
+	-I../external/compile-time-containers/include \
+	-I../external/compile-time-containers/include/ctc \
+	-I../external/compile-time-lark/include \
+	-I../external/compile-time-lark/include/ctll
+
+CXXFLAGS := -std=c++20 -I../include $(SUBMODULE_INCLUDES) $(CONSTEXPR_FLAGS) -O2 -Wall -Wextra -pedantic
 
 SOURCES := $(wildcard *.cpp)
 TARGETS := $(SOURCES:%.cpp=%)

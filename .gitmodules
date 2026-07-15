@@ -1,0 +1,6 @@
+[submodule "external/compile-time-containers"]
+	path = external/compile-time-containers
+	url = https://github.com/alexios-angel/compile-time-containers.git
+[submodule "external/compile-time-lark"]
+	path = external/compile-time-lark
+	url = https://github.com/alexios-angel/compile-time-lark.git

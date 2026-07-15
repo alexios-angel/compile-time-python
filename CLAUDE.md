@@ -48,11 +48,17 @@ line stamps (prelex lines table -> @bump_line counter -> exec stamps
 `State::current_line` -> `PyError::line`).
 
 ## Gotchas (load-bearing)
-- **Vendored, never edit here:** `include/ctll` (source of truth
-  compile-time-lark), `include/ctc` (source of truth
-  compile-time-containers). Sync manually: `cp -R` from the source repo +
-  `diff -rq` both ways. `include/ctpy/python.hpp` is GENERATED — edit
-  `python.lark`, `make regrammar`.
+- **ctc and ctll are git SUBMODULES, never edit here:**
+  `external/compile-time-containers` (ctc) and `external/compile-time-lark`
+  (ctll) — run `git submodule update --init` once after cloning; bump by
+  checking out a new commit inside the submodule and committing the gitlink.
+  The build adds `<sub>/include` AND `<sub>/include/ctc` /
+  `<sub>/include/ctll` to the include path so the headers' relative
+  `"../ctc.hpp"`-style includes (incl. the GENERATED python.hpp, whose
+  include Tablewright hardcodes) resolve via the quoted-include fallback;
+  the CMake install flattens everything back to include/{ctpy,ctc,ctll}.
+  `include/ctpy/python.hpp` is GENERATED — edit `python.lark`,
+  `make regrammar`.
 - **Grammar is (q)LL(1) at character level** (no lexer): keywords vs
   identifiers need maximal-munch left-factoring; assignment-vs-expression
   is factored through `testlist expr_stmt_tail` where Q-grammar
