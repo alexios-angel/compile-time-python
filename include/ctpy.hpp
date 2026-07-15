@@ -23,5 +23,6 @@
 // C++ <-> Python boundary design (arg<>, lift<>, file<>, pymodule<>).
 
 #include "ctpy/version.hpp"
+#include "ctpy/prelex.hpp"
 
 #endif
