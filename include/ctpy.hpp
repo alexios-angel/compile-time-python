@@ -33,6 +33,7 @@
 #include "ctpy/object.hpp"
 #include "ctpy/eval.hpp"
 #include "ctpy/builtins.hpp"
+#include "ctpy/fstring.hpp"
 #include "ctpy/exec.hpp"
 
 #endif

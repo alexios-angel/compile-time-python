@@ -341,6 +341,61 @@ manual `cp -R` + `diff -rq` in CLAUDE.md.
     via append_repr. detail::dec moved builtins.hpp -> object.hpp so
     eval.hpp error messages can spell counts.
 
+- **M7 builtins + f-strings: DONE.** builtins.hpp completes the v0.1
+  builtin table (print/len/range/sum/min/max/abs/str/int/bool/sorted/
+  enumerate/zip) plus the shared Python str()/repr() formatter;
+  fstring.hpp evaluates fstr_lit nodes; run_result gained interim
+  stdout() (2048-char cap until the M8 right-size). Tests
+  tests/builtins.cpp + tests/fstring.cpp, expectations verified against
+  CPython 3.14. Design notes:
+  - *One str() machinery for everything*: write_object(st, sink, index,
+    repr) recurses through containers (elements always repr) and NEVER
+    allocates - it only reads pools and pushes chars - so a str_sink
+    target stays the contiguous tail of the char pool while it walks;
+    print uses the same walker with a stdout_sink. repr of a str does
+    CPython's quote choice + \n\r\t\xHH escapes.
+  - *Float repr is 16 significant digits* (trailing zeros trimmed,
+    CPython's fixed/scientific thresholds at 1e16/1e-4, ".0" on
+    integral values, round-HALF-EVEN when trimming to 16 - naive +0.5
+    double-rounds 0.1+0.2 visibly). Divergence documented: CPython's
+    shortest-round-trip repr needs 17 digits for some values (0.1+0.2
+    prints "0.3" here). Everything spellable in <=16 digits matches.
+  - *Keywords exist only for print(sep=, end=)*: the call evaluator now
+    splits args into positional + kw_pass arrays (evaluated in source
+    order); def'd functions still reject keywords (M5 policy), every
+    other builtin raises "X() takes no keyword arguments" (documented
+    divergence: CPython's sum(start=)/sorted(key=,reverse=)).
+  - *enumerate/zip MATERIALIZE lists of tuples* (documented; iteration,
+    len(), indexing agree with CPython). Layout trick shared with
+    sorted(): materialize_run() pushes contiguous element copies (str
+    shares the char pool per-character, range synthesizes ints, dict
+    yields keys), then rows, then the tuple headers as one contiguous
+    run that IS the list run. sorted() is an in-place insertion sort
+    over its materialized run (stable, compare_op(lt), never
+    allocates); zip caps at 16 iterables (fixed scratch).
+  - int(str) parses sign/whitespace itself; overflow anywhere
+    (int(huge_str), int(1e300), abs(INT64_MIN)) is a soft ctpy-spelled
+    OverflowError where CPython would bignum. Messages otherwise match
+    CPython 3.14 exactly (incl. "min() iterable argument is empty",
+    "print() got an unexpected keyword argument 'foo'").
+  - *f-strings*: the M2 grammar kept bodies verbatim, so fstring.hpp
+    does the plan's mini-parse: a consteval once-per-type scan splits
+    literal segments from {expr} holes (bracket/quote-aware, so
+    f'{d["k"]}' and f'{ {1:2}[1] }' work; blanks trim; {{ }} cook with
+    the shared escape cooker), then each hole is re-run through the
+    SAME Tablewright grammar via parsed_module over a re-packed
+    ctll::fixed_string NTTP and must unwrap to module<expr_stmt<E>>.
+    Evaluation is two-phase: all holes evaluate first (they allocate
+    freely), THEN the result str is opened and parts append (nothing
+    allocates), keeping its char run contiguous. Nested f-strings in
+    the other quote kind work. Unsupported-in-v0.1 forms are HARD
+    static_asserts with named messages (format specs {x:>8},
+    conversions {x!r}, empty holes, lone/unterminated braces) - the
+    module grammar already accepted the token, so family policy says
+    the failure names the stage; is_valid<> stays parse-level only.
+  - Builtins are still not first-class values (x = len is a NameError,
+    documented in builtins.hpp).
+
 ## Risks
 
 Constexpr budget blowups (mitigations: LL(1) not Earley, loops not recursion

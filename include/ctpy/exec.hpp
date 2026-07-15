@@ -631,13 +631,15 @@ CTPY_EXPORT struct global_entry {
 	run_value value{};
 };
 
-// the result of running a module: ok()/exception() plus the globals
-// by name. INTERIM - M8 right-sizes into per-Src static storage with
-// uniform chaining views and stdout capture.
+// the result of running a module: ok()/exception(), captured stdout
+// (everything print() wrote), plus the globals by name. INTERIM - M8
+// right-sizes into per-Src static storage with uniform chaining views.
 CTPY_EXPORT struct run_result {
 	static constexpr std::size_t globals_capacity = 64;
+	static constexpr std::size_t stdout_capacity = 2048;
 
 	ctc::vector<global_entry, globals_capacity> globals{};
+	ctc::string<stdout_capacity> stdout_text{};
 	bool raised = false;
 	PyError error{};
 
@@ -646,6 +648,9 @@ CTPY_EXPORT struct run_result {
 	}
 	constexpr const PyError & exception() const noexcept {
 		return error;
+	}
+	constexpr std::string_view stdout() const noexcept {
+		return stdout_text.view();
 	}
 	constexpr run_value operator[](std::string_view name) const noexcept {
 		for (std::size_t at = 0; at < globals.size(); ++at) {
@@ -671,6 +676,9 @@ constexpr run_result run() noexcept {
 	run_result out{};
 	out.raised = st.raised;
 	out.error = st.error;
+	for (std::size_t at = 0; at < st.a.out.size() && at < run_result::stdout_capacity; ++at) {
+		out.stdout_text.push_back(st.a.out[at]); // interim cap; M8 right-sizes per Src
+	}
 	for (std::uint32_t at = 0; at < st.globals_count; ++at) {
 		if (out.globals.size() == run_result::globals_capacity) {
 			break; // interim cap; M8 right-sizes per Src

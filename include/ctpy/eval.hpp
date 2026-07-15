@@ -129,6 +129,29 @@ constexpr double parse_float(std::string_view text) noexcept {
 	return value;
 }
 
+// cook one backslash escape into an in-flight str (shared by str_lit
+// bodies here and the literal segments of f-strings, fstring.hpp)
+template <typename St> constexpr void push_cooked_escape(St & st, std::uint32_t out, char escaped) {
+	switch (escaped) {
+		case 'n': st.str_push(out, '\n'); break;
+		case 't': st.str_push(out, '\t'); break;
+		case 'r': st.str_push(out, '\r'); break;
+		case 'a': st.str_push(out, '\a'); break;
+		case 'b': st.str_push(out, '\b'); break;
+		case 'f': st.str_push(out, '\f'); break;
+		case 'v': st.str_push(out, '\v'); break;
+		case '0': st.str_push(out, '\0'); break;
+		case '\\':
+		case '\'':
+		case '"': st.str_push(out, escaped); break;
+		case '\n': break; // backslash-newline inside a literal joins lines
+		default: // unknown escapes stay verbatim, as CPython keeps them
+			st.str_push(out, '\\');
+			st.str_push(out, escaped);
+			break;
+	}
+}
+
 // cook a raw str_lit body into the char pool (escape processing
 // happens here, once, at evaluation - the parse kept bodies verbatim)
 template <typename St> constexpr std::uint32_t make_cooked_str(St & st, std::string_view raw) {
@@ -139,25 +162,7 @@ template <typename St> constexpr std::uint32_t make_cooked_str(St & st, std::str
 			st.str_push(out, unit);
 			continue;
 		}
-		const char escaped = raw[++at];
-		switch (escaped) {
-			case 'n': st.str_push(out, '\n'); break;
-			case 't': st.str_push(out, '\t'); break;
-			case 'r': st.str_push(out, '\r'); break;
-			case 'a': st.str_push(out, '\a'); break;
-			case 'b': st.str_push(out, '\b'); break;
-			case 'f': st.str_push(out, '\f'); break;
-			case 'v': st.str_push(out, '\v'); break;
-			case '0': st.str_push(out, '\0'); break;
-			case '\\':
-			case '\'':
-			case '"': st.str_push(out, escaped); break;
-			case '\n': break; // backslash-newline inside a literal joins lines
-			default: // unknown escapes stay verbatim, as CPython keeps them
-				st.str_push(out, '\\');
-				st.str_push(out, escaped);
-				break;
-		}
+		push_cooked_escape(st, out, raw[++at]);
 	}
 	return out;
 }
